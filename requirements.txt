@@ -1,0 +1,11 @@
+torch
+numpy<2
+transformers==4.57.6
+sentencepiece
+protobuf
+h5py
+pillow
+pyyaml
+opencv-python
+imageio
+scipy

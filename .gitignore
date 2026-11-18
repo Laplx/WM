@@ -1,0 +1,12 @@
+data/
+data_*/
+runs/
+logs/
+__pycache__/
+*.pyc
+.DS_Store
+codex/
+weights/
+*.pt
+*.pth
+*.safetensors
