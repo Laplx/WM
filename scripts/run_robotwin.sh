@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 三种参考配置的 RoboTwin 仿真入口。默认参数与出成绩的官方全量逐项相同；FAST=1 另开三个提速选项
+# 三种推理配置的 RoboTwin 仿真参考入口。默认参数即主线推理配置；FAST=1 另开三个提速选项
 # （--graphs --idm_graph --idm_ms：CUDA graph + 三个 IDM 多流并发，Policy 输出与默认逐位相同，只改速度）。
 set -eu
 : "${WMRUNS:?Set WMRUNS to the checkpoint root}"
