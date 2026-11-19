@@ -51,6 +51,8 @@ FAST=1 bash scripts/run_robotwin.sh wc2-fast --tasks handover_block --cfg demo_c
 
 ## 训练和真机对接
 
+真机数据的格式、取帧频率、动作约定、建根编码与微调命令见 [docs/real_robot.md](docs/real_robot.md)。
+
 `python -m probwm.encode --help` 给出头部、左腕、右腕图像与指令的编码参数。`python -m probwm.train --help` 训练 WM，`python -m probwm.idm train --help` 训练 IDM。已有带特征库的 WM 可用 `--init` 初始化；各权重的训练配置保存在 checkpoint 的 `args` 里，微调时沿用其中的视觉编码、历史长度、目标时距与模型尺寸。独立 canon 直接使用发布的权重。
 
 `probwm.robotwin_eval` 展示三路图像的顺序（头、左腕、右腕）、图像预处理（`to256`、`--jpeg std`）、头部与腕部的归一化、指令编码、14 维关节状态、按帧更新的历史和动作块集成。真机接入时请先离线回放，核对关节顺序、夹爪量程和时间戳。机旁接口应将带时标的策略输出交给本机执行器。
