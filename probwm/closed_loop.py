@@ -300,6 +300,18 @@ class Policy:
                 assert getattr(n_, "flow", False), "--idm_graph 只接 flow 头 IDM"
                 n_.forward = n_.infer
                 gwrap(n_, "ctx", s.gpool)
+        s.ms = None  # (rteasy 11-19) --idm_ms：集成成员各占一条 CUDA stream 与主 IDM 并发（issue 顺序同顺序版 → 噪声消耗相同、逐位一致）；默认关
+        if getattr(a, "idm_ms", False) and s.enets:
+            from .cgraph import Graphed
+            assert not getattr(a, "idm_ens_par", False), "--idm_ms 与 --idm_ens_par 二选一"
+            for n_ in s.enets:  # 并发重放的图不能共用显存池（共用池只保证顺序重放安全），也不能共用捕获流（cuBLAS workspace 按 (handle, stream) 分配，
+                p_, cs_ = torch.cuda.graph_pool_handle(), torch.cuda.Stream(dev)  # 同一捕获流捕获的图共用同一份 workspace，B=1 的小矩阵乘走 split-K 会互相覆盖）：
+                for k_ in ("vel", "ctx"):  # 每个成员的 vel / ctx 图各开一个池、一条捕获流；主 IDM 留在当前流、用原来的池与默认捕获流
+                    g_ = getattr(n_, k_, None)
+                    if isinstance(g_, Graphed):
+                        assert not g_.g, "--idm_ms：成员的图须在换池之前没有捕获过"
+                        g_.pool, g_.cs = p_, cs_
+            s.ms = [torch.cuda.Stream(dev) for _ in s.enets]
         s.ens_par = None  # (rteasy 11-18) --idm_ens_par：主 IDM 与集成成员（同结构）参数叠起来，torch.func.vmap(functional_call) 一次前向算全部（各成员噪声独立，同顺序版）；默认关
         if getattr(a, "idm_ens_par", False) and s.enets:
             import copy
@@ -636,6 +648,22 @@ class Policy:
         z = s.flt.step(h[:, -1], hp, s.temb[ti], s.tmask[ti], fresh).to(h.dtype)
         h = torch.cat([h[:, :-1], z[:, None]], 1)
         return torch.where(fresh[:, None, None, None], z[:, None].expand_as(h), h)
+
+    def ens_ms(s, blk, n_avg=1, every=False):  # (rteasy 11-19) --idm_ms：blk(net) → 该网络的 (B, n_act·m, ad) float 块；返回等权平均（every：另返回各网络的块）
+        cur = torch.cuda.current_stream()
+        ev = torch.cuda.Event()
+        ev.record(cur)  # 分叉点：成员流只等它之前的工作（输入都已在这之前算好）
+        o0 = torch.stack([blk(s.net) for _ in range(n_avg)]).mean(0)  # 主 IDM 照顺序版先发（先消耗随机数）
+        eo = []
+        for en, st_ in zip(s.enets, s.ms):
+            st_.wait_event(ev)
+            with torch.cuda.stream(st_):
+                eo.append(blk(en))
+        for st_, o_ in zip(s.ms, eo):
+            cur.wait_stream(st_)
+            o_.record_stream(cur)
+        out = torch.stack([o0] + eo).mean(0)
+        return (out, [o0] + eo) if every else out
 
     def graph(s, obj, *names):  # --graphs：把 obj 的这些方法换成按输入形状捕获的 CUDA graph（结果逐位不变，见 probwm/cgraph.py）
         if getattr(s.a, "graphs", False):
@@ -1442,14 +1470,19 @@ class Policy:
                 tk = {} if ptau is None else {"tau": ptau[:, :nf]}  # (xden) --idm_tau pre：计划各槽的层级（只支持 --plan 1）
                 if s.vpp:  # (vpp) IDM 另读近槽隐状态；hid：帧输入只有历史（不读计划帧）
                     nf, tk = (0 if s.vpp == "hid" else nf), {**tk, "zh": s.vhid}
-                if s.ens_par is not None:  # (rteasy 11-18) --idm_ens_par：主 IDM + 集成成员一次 vmap 前向，等权平均（同下面顺序版）
+                if s.ms is not None:  # (rteasy 11-19) --idm_ms：主 IDM 在当前流，集成成员各自一条流并发，等权平均（同下面顺序版）
+                    stale = bool(s.stl) or s.a.idm_tau == "stale"
+                    assert not (s.wact or s.vpp or (tk and not stale)), "--idm_ms 不与 --wm_act / --vpp / --idm_tau pre 同用"
+                    ins = [xk(seq[:, s.K - 1 - s.na.ih + j: s.K + j + nf]) for j in range(m)]  # 在分叉前算好（成员流只等分叉点之前的工作）
+                    out = s.ens_ms(lambda n_: torch.cat([n_(x_, *lt, zw=wh, zp=ph, **tk) for x_ in ins], 1).float(), getattr(s.a, "n_avg", None) or 1)
+                elif s.ens_par is not None:  # (rteasy 11-18) --idm_ens_par：主 IDM + 集成成员一次 vmap 前向，等权平均（同下面顺序版）
                     stale = bool(s.stl) or s.a.idm_tau == "stale"
                     assert not (s.wact or s.vpp or (tk and not stale)) and (getattr(s.a, "n_avg", None) or 1) == 1, "--idm_ens_par 不与 --wm_act / --vpp / --idm_tau pre / --n_avg 同用"
                     out = torch.cat([s.ens_par(xk(seq[:, s.K - 1 - s.na.ih + j: s.K + j + nf]), *lt, zw=wh, zp=ph, **tk) for j in range(m)], 2).float().mean(0)
                 else:
                     out = torch.stack([torch.cat([s.net(xk(seq[:, s.K - 1 - s.na.ih + j: s.K + j + nf]), *lt, zw=wh, zp=ph, **tk) for j in range(m)], 1).float()
                                        for _ in range(getattr(s.a, "n_avg", None) or 1)]).mean(0)  # --n_avg K：同一计划下 IDM 采 K 个动作块取均值（默认 1，与原来相同）
-                if s.enets and s.ens_par is None:  # (rteasy) --idm_ens：同一计划、历史、本体下另几个 IDM 各采一块，与主 IDM 的块等权平均（标准化空间，统计量已核相同）
+                if s.enets and s.ens_par is None and s.ms is None:  # (rteasy) --idm_ens：同一计划、历史、本体下另几个 IDM 各采一块，与主 IDM 的块等权平均（标准化空间，统计量已核相同）
                     stale = bool(s.stl) or s.a.idm_tau == "stale"  # (gawm X2F5CU) --idm_stale / --idm_tau stale：计划是上一次的干净估计，各槽层级全 1（= 干净；没有 tauemb 的 IDM 本来就忽略）→ 可以集成
                     assert not (s.wact or s.vpp or (tk and not stale)), "--idm_ens 不与 --wm_act / --vpp / --idm_tau pre 同用"
                     out = torch.stack([out] + [torch.cat([en(xk(seq[:, s.K - 1 - s.na.ih + j: s.K + j + nf]), *lt, zw=wh, zp=ph, **tk) for j in range(m)], 1).float()
@@ -1560,6 +1593,7 @@ def main():
     a("--idm_ens", default="", help="(rteasy) 逗号分隔的另几个 IDM ckpt（同配方不同训练种子）：各自采样后与 --idm 的动作块等权平均；默认关")
     a("--idm_graph", action="store_true", help="(rteasy 11-18) IDM 骨干（flow 头之前）按输入形状捕获 CUDA graph（flow 头的 vel 另由 --graphs 捕获）；默认关")
     a("--idm_ens_par", action="store_true", help="(rteasy 11-18) --idm_ens 的并行版：主 IDM 与成员参数叠起来 vmap 一次前向（各成员噪声独立）；默认关 = 顺序版")
+    a("--idm_ms", action="store_true", help="(rteasy 11-19) --idm_ens 的多流版：集成成员各占一条 CUDA stream 与主 IDM 并发（成员图各用独立显存池；与顺序版逐位一致）；默认关")
     a("--obs_sync", action="store_true", help="回传当前仿真状态的观测（与训练渲染一致），见文件头")
     a("--comp", default="", help="组合式指令引导清单 runs/comp/<set>.json（probwm/compose.py build）")
     a("--comp_w", default="3,0,0", help="w_f,w_p,w_n[,wm]：完整指令 / 每个子短语 / 负向（最近训练任务；wm = WM 在线选）的权重")

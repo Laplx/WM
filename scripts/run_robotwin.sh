@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# 三种参考配置的 RoboTwin 仿真入口。默认参数与出成绩的官方全量逐项相同；FAST=1 另开三个提速选项
+# （--graphs --idm_graph --idm_ms：CUDA graph + 三个 IDM 多流并发，Policy 输出与默认逐位相同，只改速度）。
 set -eu
 : "${WMRUNS:?Set WMRUNS to the checkpoint root}"
 : "${WMDATA:?Set WMDATA to the inference metadata root}"
@@ -7,10 +9,12 @@ case "${1:-}" in
   wc2)       mode=(--wm "$WMRUNS/rteasy/wmX2F5Clw3WC2/ckpt.pt") ;;
   wc2-fast)  mode=(--wm "$WMRUNS/rteasy/wmX2F5Clw3WC2/ckpt.pt" --idm_stale obs) ;;
   w40-canon) mode=(--wm "$WMRUNS/rteasy/wmX2F5Clw3W/ckpt.pt" --canon "$WMRUNS/rt/c/oursC/canon/ckpt.pt") ;;
-  *) echo 'Usage: bash scripts/run_robotwin.sh {wc2|wc2-fast|w40-canon} [robotwin_eval flags]' >&2; exit 2 ;;
+  *) echo 'Usage: [FAST=1] bash scripts/run_robotwin.sh {wc2|wc2-fast|w40-canon} [robotwin_eval flags]' >&2; exit 2 ;;
 esac
 shift
-exec python -m probwm.robotwin_eval "${mode[@]}" \
+fast=()
+[ "${FAST:-0}" = 1 ] && fast=(--graphs --idm_graph --idm_ms)
+exec python -m probwm.robotwin_eval "${mode[@]}" ${fast[@]+"${fast[@]}"} \
   --wm_data "$WMDATA" --idm "$WMRUNS/rteasy/idmPLwr.pt" \
   --idm_ens "$WMRUNS/rteasy/idmPLwrs1.pt,$WMRUNS/rteasy/idmPLwrs2.pt" \
   --sampler scratch4 --roll 1,0,8 --cfg_w 3 --fsteps 2 --ensemble 0.01 --exec 2 --jpeg std "$@"

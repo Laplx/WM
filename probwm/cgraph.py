@@ -32,6 +32,7 @@ def _ac():  # (autocast 开着?, 精度)，兼容新旧 API
 class Graphed:
     def __init__(s, f, pool=None, max_graphs=32):
         s.f, s.g, s.pool, s.max = f, {}, pool, max_graphs
+        s.cs = None  # (rteasy 11-19) 捕获用的 stream；None = torch.cuda.graph 的默认捕获流（全进程共用一条 → 共用同一份 cuBLAS workspace，图只能顺序重放）
 
     def __call__(s, *args, **kw):
         leaves, spec = pt.tree_flatten((args, kw))
@@ -62,7 +63,7 @@ class Graphed:
                     s.f(*a, **k)
         torch.cuda.current_stream().wait_stream(st)
         g = torch.cuda.CUDAGraph()
-        with torch.no_grad(), torch.cuda.graph(g, pool=s.pool):
+        with torch.no_grad(), torch.cuda.graph(g, pool=s.pool, **({"stream": s.cs} if s.cs is not None else {})):
             with ctx():
                 sout = s.f(*a, **k)
         return g, sin, sout
