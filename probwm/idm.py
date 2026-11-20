@@ -242,7 +242,8 @@ class Net(nn.Module):
         e = torch.randn_like(y)
         xt, v = (1 - tt[..., None]) * e + tt[..., None] * y, y - e
         w = 1 - pm
-        return (((s.vel(xt, tt, kv, pm=pm).float() - v.float()) ** 2).mean(-1) * w).sum() / w.sum().clamp_min(1)
+        den = getattr(s, "rtc_den", None)  # idm train --accum：整批的非前缀位置总数（各微批按整批归一，累加后等于整批损失）；默认 None = 本批自己的
+        return (((s.vel(xt, tt, kv, pm=pm).float() - v.float()) ** 2).mean(-1) * w).sum() / (w.sum().clamp_min(1) if den is None else den)
 
     def rtc_sample(s, kv, P, dv, x0=None):
         """带前缀的采样：P (B,d,ad) 标准化的已发出路点、dv (B,) 各样本有效前缀长度（0 = 无前缀，与原采样同分布）。
@@ -461,7 +462,7 @@ def woffs(a):  # 腕部相机帧相对 t 的偏移：t-n+1..t；--wfut k 再加�
     return torch.arange(1 - a.wrist, 1 + getattr(a, "wfut", 0))
 
 
-def load_wrist(data, wa, norm=None, keys="wrist"):
+def load_wrist(data, wa, norm=None, keys="wrist", sdev=None):
     """额外相机流：feats/<encoder>_<key>（与 agentview 同一全局帧序）；keys 逗号分隔时（如 right,wrist）各视角按 token 拼接，
     各自的逐通道 mu / sd（norm 为空时与 Feats 一样：固定种子抽 20000 个训练帧），多视角时 mu / sd 为 (T, D)。
     常驻 GPU；PROBWM_FEATS_CPU=1 放 CPU 内存；PROBWM_FEATS_MMAP=1 且都是本地分片库时按需读（data.CatViews，不占内存）。→ (W, wnorm)"""
@@ -479,7 +480,7 @@ def load_wrist(data, wa, norm=None, keys="wrist"):
     if os.environ.get("PROBWM_FEATS_MMAP") and ident and all("parts" in i for i in infs):
         W = CatViews([MmapParts(fd, i, len(data.src)) for fd, i in zip(fds, infs)])
         if norm is None:
-            x = W.raw(pick.cpu(), dev).float()
+            x = W.raw(pick.cpu(), sdev or dev).float()  # sdev="cpu"（idm train --wstat_cpu）：统计量在 CPU 上算，省掉启动时约 30 GB 显存
             T1 = x.shape[1] // len(ks)
             ms = [stat(x[:, v * T1:(v + 1) * T1].flatten(0, 1)) for v in range(len(ks))]
             norm = {"mu": ms[0][0].cpu(), "sd": ms[0][1].cpu()} if len(ks) == 1 else \
@@ -602,7 +603,7 @@ def train(a):
         kfi = next_contact(data, wa.data)
         zi = lambda f: torch.cat([zin(data, f, offs), getattr(data, "get", data.f.__getitem__)(kfi[f])[:, None]], 1)
     assert a.wrist <= (a.ih + 1 if a.kind == "idm" else wa.K), "腕部帧数不能超过 agentview 的历史 + 当前帧"
-    W, wn = load_wrist(data, wa, keys=getattr(a, "wkeys", "wrist") or "wrist") if a.wrist else (None, None)
+    W, wn = load_wrist(data, wa, keys=getattr(a, "wkeys", "wrist") or "wrist", **({"sdev": "cpu"} if getattr(a, "wstat_cpu", False) else {})) if a.wrist else (None, None)
     a.wT = W.shape[1] if a.wrist else 0  # 腕部 token 数（feats/<encoder>_wrist 可以是池化过的，如 RoboCasa 的 8×8）
     zw = (lambda f: zin(data, f, woffs(a), W)) if a.wrist else (lambda f: None)
     fu = fu_ema = None
@@ -715,6 +716,10 @@ def train(a):
             torch.cuda.empty_cache()
     print(f"{a.kind}: params {sum(p.numel() for p in net.parameters()) / 1e6:.2f}M  train {len(tr)}  val {len(va)}  "
           f"n_act {n_act}", flush=True)
+    pacc = (getattr(a, "accum", 1) or 1) > 1  # --accum k：全局 --bs 不变，分 k 个微批前向 / 反传（只为显存，等价整批的平均损失）；默认 1 = 原路径
+    assert not pacc or (a.kind == "idm" and fl and fu is None and not nw and vring is None and not a.lang and not getattr(a, "tau_in", "")
+                        and not getattr(a, "aux_dense", 0.0) > 0 and not getattr(a, "kf_delta", False) and a.bs % a.accum == 0), \
+        "--accum 只接普通 flow 头 IDM（可配 --rtc_dmax；不与 --fuse / --wm_frac / --vpp / --lang / --tau_in / --aux_dense / --kf_delta 同用），--bs 须被 --accum 整除"
     trg = None
     if getattr(a, "mix", ""):  # 固定比例抽训练帧：干净 / 其余增广（DR 复本）/ 生成 demo（编号 ≥ 1000），同 train --p_main --p_lg
         import numpy as np
@@ -828,13 +833,30 @@ def train(a):
         if getattr(a, "aux_dense", 0.0) > 0:  # 辅助：真实未来 8 帧（demo 内截断）的低维投影
             ix8 = torch.minimum(f[:, None] + torch.arange(1, 9, device=dev) * data.delta, data.fend[f][:, None] - 1)
             ya = getattr(data, "get", data.f.__getitem__)(ix8).float() @ net.aproj
-        with amp():
-            o = net(z + a.noise * torch.randn_like(z), *txt_tr(f), zw=w if w is None else w + a.noise * torch.randn_like(w), zp=zp(f),
-                    y=ytgt(A[f], st) if fl else None, dk=dkf(f), yaux=ya, **({"tau": tau} if tau is not None else {}),
-                    **({"zh": zh + a.noise * torch.randn_like(zh)} if zh is not None else {}), **({"pd": rtc_draw(len(f))} if rtd else {}))
-            l = o if fl else loss(o, A[f], st, a.wg)
-        opt.zero_grad(set_to_none=True)
-        (l + lf).backward()
+        if pacc:  # --accum：整批的输入噪声 / RTC 前缀长度按原顺序一次抽好，各微批前向、反传（损失 / accum）
+            mb_ = a.bs // a.accum
+            zn_, wn_, p_, y_ = z + a.noise * torch.randn_like(z), None if w is None else w + a.noise * torch.randn_like(w), zp(f), ytgt(A[f], st)
+            pd_ = rtc_draw(len(f)) if rtd else None
+            net.rtc_den = (n_act - pd_).sum().clamp_min(1).float() if rtd else None  # RTC 损失按整批的非前缀位置数归一（各微批不再 / accum）
+            opt.zero_grad(set_to_none=True)
+            l = 0.0
+            try:
+                for j in range(0, a.bs, mb_):
+                    with amp():
+                        l_ = net(zn_[j:j + mb_], zw=None if wn_ is None else wn_[j:j + mb_], zp=None if p_ is None else p_[j:j + mb_], y=y_[j:j + mb_],
+                                 **({"pd": pd_[j:j + mb_]} if rtd else {})) / (1 if rtd else a.accum)
+                    l_.backward()
+                    l = l + l_.detach()
+            finally:
+                net.rtc_den = None
+        else:
+            with amp():
+                o = net(z + a.noise * torch.randn_like(z), *txt_tr(f), zw=w if w is None else w + a.noise * torch.randn_like(w), zp=zp(f),
+                        y=ytgt(A[f], st) if fl else None, dk=dkf(f), yaux=ya, **({"tau": tau} if tau is not None else {}),
+                        **({"zh": zh + a.noise * torch.randn_like(zh)} if zh is not None else {}), **({"pd": rtc_draw(len(f))} if rtd else {}))
+                l = o if fl else loss(o, A[f], st, a.wg)
+            opt.zero_grad(set_to_none=True)
+            (l + lf).backward()
         torch.nn.utils.clip_grad_norm_(pars, 1.0)
         opt.step(), sched.step()
         if fu is not None:
@@ -850,15 +872,16 @@ def train(a):
             if vh is not None and i == i0 and len(va) > a.vpp_val:  # (vpp) val 每帧要一次 WM 前向：只用固定的 --vpp_val 帧
                 va = va[torch.randperm(len(va), device=dev, generator=torch.Generator(device=dev).manual_seed(0))[:a.vpp_val]]
             vk = (lambda g: {}) if vh is None else (lambda g, _g=torch.Generator(device=dev).manual_seed(0): {"zh": vh(g, _g)})  # (vpp) val 的隐状态：固定噪声（各次 log 可比）
+            vc = getattr(a, "val_chunk", 0) or 1024  # --val_chunk：val 分块（只省显存）
             with torch.no_grad(), amp():
-                out = torch.cat([net(fz(zi(va[j:j + 1024])), *txt(va[j:j + 1024]), zw=zw(va[j:j + 1024]),
-                                     zp=zp(va[j:j + 1024]), dk=dkf(va[j:j + 1024]), **vk(va[j:j + 1024])) for j in range(0, len(va), 1024)])
+                out = torch.cat([net(fz(zi(va[j:j + vc])), *txt(va[j:j + vc]), zw=zw(va[j:j + vc]),
+                                     zp=zp(va[j:j + vc]), dk=dkf(va[j:j + vc]), **vk(va[j:j + vc])) for j in range(0, len(va), vc)])
             m, m2 = metrics(out, A[va], st), metrics(out[:, :2], A[va, :2], st)
             xr = ""
             if rtd:  # val：第 2–3 个路点（延迟 2 个路点时实际执行的那两个），不给前缀 / 给真值前缀 d = 2
                 with torch.no_grad(), amp():
                     op = []
-                    for g_ in va.split(1024):
+                    for g_ in va.split(vc):
                         net.rtc_pre = (ytgt(A[g_], st)[:, :2], torch.full((len(g_),), 2, device=dev))
                         op.append(net(fz(zi(g_)), *txt(g_), zw=zw(g_), zp=zp(g_), dk=dkf(g_)))
                     net.rtc_pre = None
@@ -1032,6 +1055,10 @@ def main():
     a("--rtc_dmax", type=int, default=0, help="train >0：训练时 RTC——每个样本随机取前缀长度 d（见 --rtc_p0），动作块前 d 个路点用真值、层级 1（不加噪）、加零初始化的前缀掩码嵌入，"
                                                "只在其余位置算 flow 损失；推理由 closed_loop Policy.rtc_prefix（仿真：robotwin_eval --sim_delay / --rtc）给已发出的路点作前缀；只接 flow 头；默认 0 = 关")
     a("--rtc_p0", type=float, default=1 / 3, help="--rtc_dmax 时 d = 0 的概率（其余在 1..rtc_dmax 均匀）")
+    a("--accum", type=int, default=1, help="train：梯度累积——全局 --bs 不变，每步分这么多个微批前向 / 反传（显存放不下整批时用，等价整批的平均损失）；只接普通 flow 头 IDM（可配 --rtc_dmax）；默认 1")
+    a("--val_chunk", type=int, default=0, help="train：val 每块的帧数（只省显存，不改训练）；默认 0 = 1024")
+    a("--wstat_cpu", action="store_true", help="train：腕部特征的归一化统计量（固定抽 20000 个训练帧）在 CPU 上算（需 PROBWM_FEATS_MMAP=1 的分片库）；"
+                                              "默认在 GPU 上算，启动时要多约 30 GB 显存（与批大小无关），小显存卡上打开；结果只差浮点舍入")
     a("--wpf", type=int, default=0, help="降频档：帧—路点比，IDM 的一帧 = 这么多个路点（须是 STRIDE 的倍数，如 4）。数据根不变（帧 k ↔ a_{2k}），按 delta = wpf / 2 隔帧取"
                                          "（同 train --delta）：历史 / 未来 / 本体 / 腕部帧间隔都是 wpf 个路点，动作块 = wpf·H 个路点（--wpf 4 配 --H 4 = 16 个路点）；存进 ckpt args，"
                                          "推理时 Policy / robotwin_eval 从 IDM ckpt 读（每次决策执行 wpf 个路点、滚动缓存每次平移 1 帧）；WM 须用 train --delta wpf/2 训；默认 0 = 2（原行为）")
