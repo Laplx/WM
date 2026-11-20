@@ -143,12 +143,12 @@ python -m probwm.train --data $D --suites '' --text flan-t5-large_seen64 --mode 
 for s in 0 1 2; do
   I=$WMRUNS/rteasy/idmPLwr$([ $s = 0 ] || echo s$s).pt
   PROBWM_FEATS_MMAP=1 python -m probwm.idm train --kind idm --ih 3 --d 768 --depth 6 --H 8 --head flow --proprio qpos \
-    --data $D --h5 $D/h5 --wm runs/wm_real/ckpt.pt --wrist 1 --wkeys wl,wr --seed $s \
+    --data $D --h5 $D/h5 --wm $WMRUNS/rt/c/oursC/wm512/ckpt.pt --wrist 1 --wkeys wl,wr --seed $s \
     --init $I --lr 3e-5 --steps 1500 --log 100 --out runs/idm_real_s$s.pt
 done
 ```
 
-- 结构参数与仿真的三个腕部 IDM 相同（`torch.load(ckpt)["args"]` 可查全部），`--init` 从对应种子出发。`--wm` 只用来取数据根与头部特征的归一化，指向挑出来的那份 WM，与推理时一致。
+- 结构参数与仿真的三个腕部 IDM 相同（`torch.load(ckpt)["args"]` 可查全部），`--init` 从对应种子出发。`--wm` 只用来取头部特征的编码名与归一化（数据根由 `--data` 给）：须是只读头部特征的 WM，用仿真的 `wm512`（训练三个腕部 IDM 时也是它）；它的头部归一化与 W40 / WC2 及第 5 节微调后的 WM 相同（都沿用 `--norm_from`），与推理时一致。不要指向第 5 节微调出来的 WM：它读三视图特征（`dinov3_vits16hwf`），IDM 会去找不存在的 `dinov3_vits16hwf_wl` 而报错。
 - 先只适配并验证种子 0 的单个 IDM；效果正常再训另两个，推理时用 `--idm … --idm_ens …` 做三者集成。
 - 步数：IDM 批 256，1 轮 ≈ 训练集 WM 帧数 ÷ 256 步。上面的例子里 1 轮约 55 步，`--steps 1500` 约 27 轮；做图像增强时用 `--steps 2500`。IDM 只在结束时存一份，日志里 `val nmse` 若在最后几百步回升，减少步数重训（单次只要十几分钟）。输入特征噪声 `--noise 0.1` 是默认值，不要关。
 - 核对每个关节和夹爪的语义、量程与仿真一致。
@@ -206,7 +206,7 @@ PROBWM_FEATS_MMAP=1 python -m probwm.idm train --kind idm --ih 3 --d 768 --depth
 for s in 0 1 2; do
   I=$WMRUNS/rtc/idmPLwrR$([ $s = 0 ] || echo s$s).pt   # 仿真 RTC 权重（若随权重分发）；没有就用第 6 节的 $WMRUNS/rteasy/idmPLwr….pt
   PROBWM_FEATS_MMAP=1 python -m probwm.idm train --kind idm --ih 3 --d 768 --depth 6 --H 8 --head flow --proprio qpos \
-    --data $D --h5 $D/h5 --wm runs/wm_real/ckpt.pt --wrist 1 --wkeys wl,wr --seed $s \
+    --data $D --h5 $D/h5 --wm $WMRUNS/rt/c/oursC/wm512/ckpt.pt --wrist 1 --wkeys wl,wr --seed $s \
     --init $I --lr 3e-5 --steps 1500 --log 100 --rtc_dmax 4 --rtc_p0 0.333 --out runs/idm_real_rtc_s$s.pt
 done
 ```
