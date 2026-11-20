@@ -322,6 +322,8 @@ def main():
     a("--idm_graph", action="store_true", help="(rteasy 11-18) closed_loop --idm_graph：IDM 骨干捕获 CUDA graph；默认关")
     a("--idm_ens_par", action="store_true", help="(rteasy 11-18) closed_loop --idm_ens_par：集成并行（vmap 一次前向）；默认关")
     a("--idm_ms", action="store_true", help="(rteasy 11-19) closed_loop --idm_ms：集成成员多流并发（逐位同顺序版）；默认关")
+    a("--compile", default="", help="closed_loop --compile（torch.compile 模式；配 --graphs 用 default 或 max-autotune-no-cudagraphs）；默认空 = 关")
+    a("--compile_on", default="wm,canon,idm,enc", help="closed_loop --compile_on")
     a("--graphs", action="store_true", help="(11-19) closed_loop --graphs：编码器 / WM / IDM 速度场 / canon 的前向按输入形状捕获 CUDA graph（结果逐位不变）；默认关")
     a = p.parse_args()
     if a.instr:  # worker 由 spawn 起，继承环境变量
@@ -373,7 +375,7 @@ def main():
                          canon_steps=a.canon_steps, canon_tau0=0.0, poe=a.poe, prior=a.prior, fsteps=a.fsteps, roll=a.roll, seed=a.seed, n_env=n * (2 if a.ph2 else 1),
                          **({"idm_tau": a.idm_tau} if a.idm_tau else {}), **({"idm_stale": a.idm_stale} if a.idm_stale else {}), **({"replan": a.replan} if a.replan else {}),
                          **({"any_far": a.any_far} if a.any_far else {}), **({"near_only": True} if a.near_only else {}), **({"det_cfg": True} if a.det_cfg else {}),
-                         **({"roll_shift": a.exec // 2} if a.exec > a.obs_every > 0 else {}), **({"idm_ens": a.idm_ens} if a.idm_ens else {}), **({"idm_ens_par": True} if a.idm_ens_par else {}), **({"idm_graph": True} if a.idm_graph else {}), **({"idm_ms": True} if a.idm_ms else {}), **({"graphs": True} if a.graphs else {}),
+                         **({"roll_shift": a.exec // 2} if a.exec > a.obs_every > 0 else {}), **({"idm_ens": a.idm_ens} if a.idm_ens else {}), **({"idm_ens_par": True} if a.idm_ens_par else {}), **({"idm_graph": True} if a.idm_graph else {}), **({"idm_ms": True} if a.idm_ms else {}), **({"graphs": True} if a.graphs else {}), **({"compile": a.compile, "compile_on": a.compile_on} if a.compile else {}),
                          **({"n_avg": a.n_avg} if a.n_avg > 1 else {}), **({"roll_k": a.roll_k, "roll_sel": a.roll_sel, "roll_kc": a.roll_kc} if a.roll_k > 1 else {}),
                          **({"goal_first": True, "gf_fresh": a.gf_fresh} if a.goal_first else {}), **({"lead_k": a.lead_k, "gf_fresh": a.gf_fresh} if a.lead_k else {}),
                          **({"wm_ens": a.wm_ens} if a.wm_ens else {}), **({"wm_data": a.wm_data} if a.wm_data else {}), **({"ov": a.ov, "ov_log": True} if a.ov else {}), **({"t0_ignore": True} if a.t0_ignore else {}), **({"t0_sde": a.t0_sde} if a.t0_sde >= 0 else {})), dev)  # (rteasy) --exec 4 --obs_every 2：中途帧补进历史，MSF 滚动缓存每次决策平移 exec / 2 帧

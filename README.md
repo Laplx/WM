@@ -33,8 +33,9 @@ FAST=1 bash scripts/run_robotwin.sh wc2-fast --tasks handover_block --cfg demo_c
 ## 时延
 
 - 提速选项：`--graphs`（编码器、WM、IDM 速度场、canon 的前向按输入形状捕获 CUDA graph）、`--idm_graph`（IDM 骨干也捕获）、`--idm_ms`（三个 IDM 各走一条 CUDA stream 并发）。三者只改速度，策略输出逐位不变。
+- `--compile default`（`run_robotwin.sh` 用 `COMPILE=1`）：编码器、WM、canon、IDM 先过 torch.compile 再捕获 CUDA graph，每次决策的总计算约降到 0.5–0.65 倍（WM 约减半）。输出不逐位相同，差异与 bf16 数值噪声同量级，仿真闭环检验表现不变。首次决策要编译（冷启动约 100 s，`TORCHINDUCTOR_CACHE_DIR` 指向固定目录可复用缓存），每个新输入形状各编一次；真机 B=1 时开机先空跑几次决策预热。
 - WM 每次决策只走 1 步，但在 B=1 时已受算力限制，是主要瓶颈；高效推理只把 WM 移出关键路径，WM 仍须在下一次决策之前算完。
-- 在自己的卡上实测：`python scripts/latency.py ... --graphs --idm_graph --idm_ms --prof --B 1 --out lat.json`（参数见脚本开头）。`crit` 为帧 → 动作的关键路径，`total` 为每次决策的全部计算，`--prof` 给出编码 / canon / WM / IDM 分项。
+- 在自己的卡上实测：`python scripts/latency.py ... --graphs --idm_graph --idm_ms --compile default --prof --B 1 --out lat.json`（参数见脚本开头）。`crit` 为帧 → 动作的关键路径，`total` 为每次决策的全部计算，`--prof` 给出编码 / canon / WM / IDM 分项。
 
 ## 真机节奏
 
@@ -47,7 +48,7 @@ FAST=1 bash scripts/run_robotwin.sh wc2-fast --tasks handover_block --cfg demo_c
 1. 先在机旁的卡上用 `scripts/latency.py --prof` 实测，确认关键路径与每次决策的全部计算是否满足上面两条节奏条件。
 2. 出现抖动时，先定位最早出现的层：同一关节画"预测动作块 → 发布目标 → 实测反馈"，一次只改一个因素。
 3. WM 算不过来（每次决策的计算超过 1 个 WM 帧间隔）时的办法：训练时加大取帧间隔、保持 `--exec 2`，拉长决策间隔；或换更快的卡。关掉语言 CFG 能让 WM 计算约减半，但对效果的影响没有验证过。
-4. RTC：默认同步执行加时间集成（`--ensemble 0.01`），不需要 RTC。只有改成异步执行（边执行旧动作块边算新块）时才考虑；那时优先选训练时 RTC——只加在 IDM 上，增加"已执行动作前缀"输入、训练时随机采延迟，推理没有额外开销。它改动了方法，应先在仿真里验证不变差再上真机；异步后的决策节奏也要与 WM 的取帧间隔、滚动缓存一致。
+4. RTC：默认同步执行加时间集成（`--ensemble 0.01`），不需要 RTC。改成异步执行（边执行旧动作块边算新块）时，按时间戳对齐、丢掉新块里已过期的路点即可：仿真里延迟 2 个路点时这样做表现不变。训练时 RTC（IDM 增加"已发出动作前缀"输入）在仿真里不伤同步执行，但延迟 2 个路点时没有带来改进，不建议默认使用（本仓库不含该功能）；它只让换块处的跳变变小，真机若异步后在换块处出现明显抖动再考虑。异步后的决策节奏也要与 WM 的取帧间隔、滚动缓存一致。
 
 ## 训练和真机对接
 

@@ -299,6 +299,7 @@ class Policy:
             for n_ in [s.net] + s.enets:
                 assert getattr(n_, "flow", False), "--idm_graph 只接 flow 头 IDM"
                 n_.forward = n_.infer
+                s.accel(n_, "idm", "ctx")  # --compile：骨干先编译再捕获（默认关 = 不动）
                 gwrap(n_, "ctx", s.gpool)
         s.ms = None  # (rteasy 11-19) --idm_ms：集成成员各占一条 CUDA stream 与主 IDM 并发（issue 顺序同顺序版 → 噪声消耗相同、逐位一致）；默认关
         if getattr(a, "idm_ms", False) and s.enets:
@@ -665,7 +666,19 @@ class Policy:
         out = torch.stack([o0] + eo).mean(0)
         return (out, [o0] + eo) if every else out
 
+    def accel(s, obj, tag, *names):  # --compile：tag 在 --compile_on 里的模块，把这些方法 torch.compile（在 --graphs 捕获之前；默认关 = 不动）
+        a = s.a
+        if tag and getattr(a, "compile", "") and tag in (getattr(a, "compile_on", "") or "").split(","):
+            import torch._dynamo as dyn
+            for k in ("cache_size_limit", "recompile_limit", "accumulated_cache_size_limit", "accumulated_recompile_limit"):
+                if hasattr(dyn.config, k):  # 按输入形状各编一份（B、CFG 两路、新回合的子批）：默认上限不够
+                    setattr(dyn.config, k, max(getattr(dyn.config, k), 256))
+            for n in names:
+                setattr(obj, n, torch.compile(getattr(obj, n), mode=None if a.compile == "default" else a.compile, dynamic=False))
+
     def graph(s, obj, *names):  # --graphs：把 obj 的这些方法换成按输入形状捕获的 CUDA graph（结果逐位不变，见 probwm/cgraph.py）
+        tag = "enc" if obj is s else "canon" if obj is getattr(s, "cm", None) else "idm" if isinstance(obj, s.idm.Net) else "wm" if obj is getattr(s, "wm", None) else ""
+        s.accel(obj, tag, *names)  # --compile（默认关 = 不动）
         if getattr(s.a, "graphs", False):
             from .cgraph import wrap
             if not hasattr(s, "gpool"):
@@ -1592,6 +1605,9 @@ def main():
     a("--wm_ens", default="", help="(rteasy) 逗号分隔的另几个 WM ckpt（同特征 / norm / 时距槽）：各自滚动、各自缓存，IDM 读的计划按槽平均；默认关")
     a("--idm_ens", default="", help="(rteasy) 逗号分隔的另几个 IDM ckpt（同配方不同训练种子）：各自采样后与 --idm 的动作块等权平均；默认关")
     a("--idm_graph", action="store_true", help="(rteasy 11-18) IDM 骨干（flow 头之前）按输入形状捕获 CUDA graph（flow 头的 vel 另由 --graphs 捕获）；默认关")
+    a("--compile", default="", help="torch.compile 模式：default / max-autotune-no-cudagraphs（配 --graphs 时不要用带 inductor cudagraphs 的 max-autotune）；默认空 = 关。"
+      "结果不逐位相同（差在 bf16 数值噪声量级）；首次决策要编译，每个新输入形状各编一次")
+    a("--compile_on", default="wm,canon,idm,enc", help="--compile 作用的模块：wm = 上下文编码与速度场，canon，idm = flow 头 vel 与骨干 ctx（骨干要 --idm_graph），enc = 视觉编码器")
     a("--idm_ens_par", action="store_true", help="(rteasy 11-18) --idm_ens 的并行版：主 IDM 与成员参数叠起来 vmap 一次前向（各成员噪声独立）；默认关 = 顺序版")
     a("--idm_ms", action="store_true", help="(rteasy 11-19) --idm_ens 的多流版：集成成员各占一条 CUDA stream 与主 IDM 并发（成员图各用独立显存池；与顺序版逐位一致）；默认关")
     a("--obs_sync", action="store_true", help="回传当前仿真状态的观测（与训练渲染一致），见文件头")

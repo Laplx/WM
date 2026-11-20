@@ -5,7 +5,7 @@
   --prof 另跑一遍分项计时（编码 / canon / WM / IDM，各项前后同步；只看分项，关键路径与总计以不插同步的那遍为准）。
 例（WC2 高效版，B=1，开全部提速选项）：
   python scripts/latency.py --wm $WMRUNS/rteasy/wmX2F5Clw3WC2/ckpt.pt --wm_data $WMDATA --idm $WMRUNS/rteasy/idmPLwr.pt \
-      --idm_ens $WMRUNS/rteasy/idmPLwrs1.pt,$WMRUNS/rteasy/idmPLwrs2.pt --idm_stale obs --graphs --idm_graph --idm_ms --prof --B 1 --out lat_wc2st.json
+      --idm_ens $WMRUNS/rteasy/idmPLwrs1.pt,$WMRUNS/rteasy/idmPLwrs2.pt --idm_stale obs --graphs --idm_graph --idm_ms --compile default --prof --B 1 --out lat_wc2st.json
 """
 import argparse
 import json
@@ -22,6 +22,7 @@ def main():
     p.add_argument("--idm_graph", action="store_true", help="closed_loop --idm_graph（IDM 骨干捕获 CUDA graph）")
     p.add_argument("--chk_graph", action="store_true", help="配 --idm_graph：截下 IDM 的输入，同 fixed_eps 下逐网络比原 forward 与 graph 版（Net.infer）")
     p.add_argument("--params", action="store_true", help="另数参数量（从 ckpt / 权重建出的模块数 parameters()）：WM（含腕部输入层）、单个 IDM、canon、DINOv3-S、flan-t5-large 编码器")
+    p.add_argument("--compile", default="", help="closed_loop --compile 模式（default 等；首次决策要编译，算在 --warmup 里）"); p.add_argument("--compile_on", default="wm,canon,idm,enc")
     p.add_argument("--idm_ms", action="store_true", help="closed_loop --idm_ms（集成成员多流并发）")
     p.add_argument("--chk_ms", action="store_true", help="配 --idm_ms：① 同帧同种子下另建一个顺序版 Policy，逐次决策比动作（逐位）；② 截下 IDM 输入，fixed_eps 与重置种子两种噪声下逐网络比顺序 graph 版 / 原 forward 与多流版")
     p.add_argument("--chk_par", action="store_true", help="配 --idm_ens_par：先用顺序版跑几次决策、截下 IDM 的输入，同噪声（fixed_eps）下逐成员比顺序版与并行版的输出")
@@ -53,6 +54,8 @@ def main():
         kw["idm_graph"] = True
     if o.idm_ms:
         kw["idm_ms"] = True
+    if o.compile:
+        kw["compile"], kw["compile_on"] = o.compile, o.compile_on
     pol = Policy(cl_args(**kw), dev)
     xw = bool(pol.wa.__dict__.get("tgt_tok", 0))  # 同 robotwin_eval：train --tgt_tok 的多视角 WM，上下文带双腕
     T, D = pol.dims
