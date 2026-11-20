@@ -14,6 +14,9 @@ meta/actions.npy 只存了 a_{2k}，完整的 20 Hz 动作从原始 hdf5 读取�
 训练时随机取 --wm 的改写增广表里的一条、文本嵌入加相对 RMS 的高斯噪声（同 train.py tx()），val 用原指令。
 --head flow：π0 式动作专家，用线性 flow matching 生成整个动作块（2H 个，6 维标准化连续量 + 夹爪 ±1 一起作为 7 维流输出，推理取符号）；
 带噪动作 token（AdaLN(τ)）经交叉注意力读骨干输出（KV 每次决策只算一次），Euler --fsteps 步。--H 8 时条件为 WM 的整个 8 帧计划。
+--rtc_dmax D（训练时 RTC，默认关）：flow 头另学"已发出动作前缀"条件——训练时每个样本随机取前缀长度 d ∈ {0..D}，动作块前 d 个路点用真值、
+层级 1（不加噪）、加零初始化的前缀掩码嵌入 pemb，只在其余位置算 flow 损失；推理时 Net.rtc_pre（closed_loop Policy.rtc_prefix 设）给前缀，
+输出的前 d 个路点就是前缀、其余接着生成。不给前缀时与原网络逐位相同。
 
   python -m probwm.idm train --kind idm --ih 3 --out runs/goal/idm/idm.pt
   python -m probwm.idm train --kind bc --p_drop 0.1 --noise 0.2 --out runs/goal/idm/bc.pt
@@ -58,8 +61,11 @@ def pfeat(zp):  # 本体感觉历史 (B,nf,dp) 原始值 → 当前值 + 相邻�
 
 
 class Net(nn.Module):
-    def __init__(s, D, T, n_in, n_act, d_txt=0, d=256, depth=2, heads=4, nq=4, p_drop=0.0, n_w=0, n_p=0, flow=False, T_w=0, rope=False, ad=7, kfd=False, aux_pd=0, ntau=0, nh=0, dhid=0):
+    def __init__(s, D, T, n_in, n_act, d_txt=0, d=256, depth=2, heads=4, nq=4, p_drop=0.0, n_w=0, n_p=0, flow=False, T_w=0, rope=False, ad=7, kfd=False, aux_pd=0, ntau=0, nh=0, dhid=0, rtc=False):
         super().__init__()
+        if rtc:  # 训练时 RTC（idm train --rtc_dmax）：动作块前缀位置（已发出的路点）的掩码嵌入，零初始化（不给前缀时与原模型同构）；只接 flow 头
+            assert flow, "--rtc_dmax 只接 flow 头 IDM"
+            s.pemb = nn.Parameter(torch.zeros(d))
         if nh:  # (vpp) 读冻结 WM 的近槽隐状态（--vpp）：nh 个槽 × 每 patch dhid 维（WM 宽度），逐槽无仿射 LayerNorm 后按通道拼接 → 线性层，逐 patch 加到骨干输入
             s.nh, s.hln, s.hin = nh, nn.LayerNorm(dhid, elementwise_affine=False), nn.Linear(nh * dhid, d)
         if ntau:  # (xden) 噪声感知 IDM（--tau_in）：计划各槽的流匹配层级 τ（τ=1 干净）→ 逐 patch 加到骨干输入；最后一层零初始化
@@ -97,7 +103,7 @@ class Net(nn.Module):
         s.mlp = nn.Sequential(nn.LayerNorm(nq * d), nn.Dropout(p_drop), nn.Linear(nq * d, 2 * d), nn.GELU(),
                               nn.Linear(2 * d, 2 * d), nn.GELU(), nn.Linear(2 * d, n_act * ad))
 
-    def forward(s, zs, txt=None, tmask=None, zw=None, zp=None, y=None, dk=None, yaux=None, tau=None, zh=None):
+    def forward(s, zs, txt=None, tmask=None, zw=None, zp=None, y=None, dk=None, yaux=None, tau=None, zh=None, pd=None):
         """zs (B,n_in,T,D) → (B,n_act,7)：前 6 维为标准化的连续动作，第 7 维为夹爪 logit（flow 头：夹爪值，取符号）。语言作为一个额外 token。
         zw (B,n_w,T,D)：腕部相机帧；zp (B,nf,dp)：本体感觉原始值（各自只在对应网络上使用）。
         flow 头：给 y（标准化动作块，夹爪 ±1）时返回 flow matching 损失，否则从噪声 Euler s.steps 步采样。
@@ -132,7 +138,7 @@ class Net(nn.Module):
         if s.flow:
             kv = [b.ca.kvs(s.hn0(h)) for b in s.fblocks]
             if y is not None:
-                l = fm.loss(s.vel, kv, y, "abs")
+                l = fm.loss(s.vel, kv, y, "abs") if pd is None else s.rtc_loss(kv, y, pd)  # pd (B,)：各样本的前缀长度（--rtc_dmax 训练）
                 if yaux is not None and hasattr(s, "auxh"):  # yaux (B,8,T,aux_pd)：真实未来 8 帧特征 @ aproj
                     T = s.pos.shape[1]
                     pa = s.auxh(h[:, :T]).float().view(len(h), T, 8, -1).transpose(1, 2)
@@ -140,8 +146,14 @@ class Net(nn.Module):
                 return l
             # 推理时可选（调用方在 net 上设属性，默认都没有 → 原行为）：fixed_eps (B,n_act,ad) 给定的初始噪声；
             # warm_init = (z (B,n_act,ad) 标准化动作块, ok (B,) bool, τ0)：动作滚动——ok 的样本从 z 加噪到 τ0 起积分，其余从纯噪声。last_out 存本次输出。
+            # rtc_pre = (P (B,d,ad) 标准化的已发出路点, dv (B,) 各样本前缀长度 ≤ d)：动作块前 dv 个位置固定为 P（rtc_sample）；None（默认）= 原行为。
+            # Policy.rtc_prefix 只在至少一个样本 dv > 0 时才设（这里不读 dv，避免 GPU 同步）
             z0, x0, wi = h.new_zeros(len(h), s.n_act, s.ad, dtype=torch.float), getattr(s, "fixed_eps", None), getattr(s, "warm_init", None)
-            if wi is None or not bool(wi[1].any()):
+            rp = getattr(s, "rtc_pre", None)
+            if rp is not None:
+                assert wi is None, "rtc_pre 不与 warm_init（--act_roll）同用"
+                out = s.rtc_sample(kv, rp[0], rp[1], x0)
+            elif wi is None or not bool(wi[1].any()):
                 out = fm.sample(s.vel, kv, z0, "abs", steps=s.steps, x0=x0)[0]
             else:
                 ok = wi[1]
@@ -191,7 +203,11 @@ class Net(nn.Module):
         """(rteasy 11-18) closed_loop --idm_graph 的推理入口（net.forward 换成它）：kv 由 s.ctx 出（可被 CUDA graph 捕获），采样同 forward 的推理分支（噪声在外面照常抽）。"""
         kv = s.ctx(zs, txt, tmask, zw, zp, dk, tau, zh)
         z0, x0, wi = zs.new_zeros(len(zs), s.n_act, s.ad, dtype=torch.float), getattr(s, "fixed_eps", None), getattr(s, "warm_init", None)
-        if wi is None or not bool(wi[1].any()):
+        rp = getattr(s, "rtc_pre", None)  # 同 forward 的推理分支
+        if rp is not None:
+            assert wi is None, "rtc_pre 不与 warm_init（--act_roll）同用"
+            out = s.rtc_sample(kv, rp[0], rp[1], x0)
+        elif wi is None or not bool(wi[1].any()):
             out = fm.sample(s.vel, kv, z0, "abs", steps=s.steps, x0=x0)[0]
         else:
             ok = wi[1]
@@ -203,13 +219,46 @@ class Net(nn.Module):
         s.last_out = out
         return out
 
-    def vel(s, x, t, kv, *_):  # flow 头的速度场：x (B,n_act,7) 带噪动作块，t (B,) → (B,n_act,7)
+    def vel(s, x, t, kv, *_, pm=None):  # flow 头的速度场：x (B,n_act,7) 带噪动作块，t (B,) → (B,n_act,7)
+        # t 也可以是 (B,n_act) 逐位置层级（AdaLN 逐 token，model.modulate / Block 支持）；pm (B,n_act) 前缀掩码（1 = 已发出的路点）→ 加 pemb。默认原行为
         g = s.ain(x.to(s.ain.weight.dtype)) + s.apos
-        c = s.temb(tsin(t).to(g.dtype))
+        if pm is not None:
+            g = g + pm[..., None].to(g.dtype) * s.pemb.to(g.dtype)
+        c = s.temb(tsin(t.flatten()).to(g.dtype)).view(*t.shape, -1) if t.dim() == 2 else s.temb(tsin(t).to(g.dtype))
         for b, k in zip(s.fblocks, kv):
             g = b(g, c, k)
         sh, sc = s.hada(c).chunk(2, -1)
         return s.head(modulate(s.hn(g), sh, sc))
+
+    def rtc_loss(s, kv, y, pd):
+        """训练时 RTC 的 flow 损失：y (B,n_act,ad) 标准化动作块，pd (B,) 各样本的前缀长度 d（已发出的路点数）。
+        层级抽法同 fm.loss（abs、α 3、30% 均匀）；前 d 个位置层级置 1（x_τ = y，不加噪）并加 pemb，只在其余位置算损失（逐 token 平均）。d = 0 的样本与原损失同分布。"""
+        B, N = y.shape[:2]
+        u = torch.rand(B, device=y.device)
+        t = torch.where(torch.rand(B, device=y.device) < 0.3, u, fm.shift(u, 3.0))
+        pm = (torch.arange(N, device=y.device)[None] < pd[:, None]).float()
+        tt = torch.where(pm > 0, 1.0, t[:, None])
+        e = torch.randn_like(y)
+        xt, v = (1 - tt[..., None]) * e + tt[..., None] * y, y - e
+        w = 1 - pm
+        return (((s.vel(xt, tt, kv, pm=pm).float() - v.float()) ** 2).mean(-1) * w).sum() / w.sum().clamp_min(1)
+
+    def rtc_sample(s, kv, P, dv, x0=None):
+        """带前缀的采样：P (B,d,ad) 标准化的已发出路点、dv (B,) 各样本有效前缀长度（0 = 无前缀，与原采样同分布）。
+        Euler 网格同 fm.sample（τ0 = 0、α 3、s.steps 步，初始噪声照常抽或用 x0）；前缀位置每步都写回 P、层级 1 + pemb，输出的前 dv 个位置就是 P。"""
+        B, N, dev = len(dv), s.n_act, dv.device
+        pm = torch.arange(N, device=dev)[None] < dv[:, None]
+        Pf = torch.zeros(B, N, s.ad, device=dev)
+        k = min(N, P.shape[1])
+        Pf[:, :k] = P[:, :k].float()
+        m3, pmf = pm[..., None], pm.float()
+        x = torch.randn(B, N, s.ad, device=dev) if x0 is None else x0.float()
+        x = torch.where(m3, Pf, x)
+        ts = fm.shift(torch.linspace(0, 1, s.steps + 1), 3.0).tolist()
+        for t0, t1 in zip(ts[:-1], ts[1:]):
+            v = s.vel(x, torch.full((B, N), t0, device=dev).masked_fill(pm, 1.0), kv, pm=pmf)
+            x = torch.where(m3, Pf, x + (t1 - t0) * v)
+        return x
 
 
 def next_contact(data, root):
@@ -295,7 +344,8 @@ def new_net(a, dims, K, n_act):
     net = Net(D, T, len(offsets(a, K)) + int(getattr(a, "kf_extra", False)), n_act, Dt if a.kind == "bc" or a.lang else 0, a.d, a.depth, p_drop=a.p_drop, n_w=len(woffs(a)) if a.wrist else 0, T_w=getattr(a, "wT", 0),
               n_p=a.pdim * len(poffs(a, K)), flow=a.head == "flow", rope=getattr(a, "rope", False), ad=getattr(a, "adim", 7),
               kfd=getattr(a, "kf_delta", False), aux_pd=getattr(a, "aux_pd", 64) if getattr(a, "aux_dense", 0.0) > 0 else 0,
-              ntau=a.H if getattr(a, "tau_in", "") else 0, nh=a.H if getattr(a, "vpp", "") else 0, dhid=getattr(a, "vpp_d", 0))
+              ntau=a.H if getattr(a, "tau_in", "") else 0, nh=a.H if getattr(a, "vpp", "") else 0, dhid=getattr(a, "vpp_d", 0),
+              rtc=(getattr(a, "rtc_dmax", 0) or 0) > 0)
     net.steps, net.p_pdrop = a.fsteps, a.p_pdrop
     if getattr(a, "aux_dense", 0.0) > 0:
         net.lam_aux = a.aux_dense
@@ -598,8 +648,21 @@ def train(a):
             return vb[0], zi(vb[0]), vb[1]
         print(f"vpp {a.vpp}：WM {a.wm}（d{wa.d}，槽 {wa.tgt_offs}，指纹 {a.vpp_fp:.6g}），每步新算 {min(vnew, a.bs)} / {a.bs} 个隐状态", flush=True)
     net = new_net(a, ck["dims"], wa.K, n_act).to(dev)
+    rtd = getattr(a, "rtc_dmax", 0) or 0  # 训练时 RTC：每个样本的前缀长度 d，以 --rtc_p0 的概率为 0，否则在 1..rtc_dmax 均匀（rtc_draw）
+    if rtd:
+        assert a.head == "flow" and a.kind == "idm" and not getattr(a, "fuse", ""), "--rtc_dmax 只接普通 flow 头 IDM（不与 --fuse 同用）"
+        assert rtd < n_act, "--rtc_dmax 须小于动作块长度"
+        rtc_draw = lambda B: torch.where(torch.rand(B, device=dev) < a.rtc_p0, 0, torch.randint(1, rtd + 1, (B,), device=dev))
+        print(f"--rtc_dmax {rtd}：前缀长度 d = 0 的概率 {a.rtc_p0:g}，其余在 1..{rtd} 均匀；前缀位置层级 1、不算损失（动作块 {n_act} 个路点）", flush=True)
     if getattr(a, "init", ""):  # 从已有头继续（结构须相同；本体 mu / sd 下面照样按本数据重算）
-        print("init from", a.init, net.load_state_dict(torch.load(a.init, map_location="cpu")["model"]), flush=True)
+        sd_ = torch.load(a.init, map_location="cpu")["model"]
+        assert rtd or "pemb" not in sd_, f"--init {a.init} 是训练时 RTC 的 IDM（带 pemb），须同时给 --rtc_dmax"
+        if rtd:  # 从普通 IDM 热启动时只缺 pemb（零初始化）；从 RTC 的 IDM 热启动时全部键对上
+            r_ = net.load_state_dict(sd_, strict=False)
+            assert set(r_.missing_keys) <= {"pemb"} and not r_.unexpected_keys, r_
+            print("init from", a.init, "（--rtc_dmax：" + ("缺 pemb，零初始化）" if r_.missing_keys else "全部键对上）"), flush=True)
+        else:
+            print("init from", a.init, net.load_state_dict(sd_), flush=True)
     assert not getattr(a, "kf_delta", False) or getattr(a, "far_kf", False), "--kf_delta 要配 --far_kf"
     dkf = (lambda f: kfi[f] - f) if getattr(a, "kf_delta", False) else (lambda f: None)  # 到关键帧还有几帧（训练用真实值）
     if a.proprio:  # 逐维标准化统计量（训练帧，开头不足的历史同样重复第一帧）
@@ -763,7 +826,7 @@ def train(a):
         with amp():
             o = net(z + a.noise * torch.randn_like(z), *txt_tr(f), zw=w if w is None else w + a.noise * torch.randn_like(w), zp=zp(f),
                     y=ytgt(A[f], st) if fl else None, dk=dkf(f), yaux=ya, **({"tau": tau} if tau is not None else {}),
-                    **({"zh": zh + a.noise * torch.randn_like(zh)} if zh is not None else {}))
+                    **({"zh": zh + a.noise * torch.randn_like(zh)} if zh is not None else {}), **({"pd": rtc_draw(len(f))} if rtd else {}))
             l = o if fl else loss(o, A[f], st, a.wg)
         opt.zero_grad(set_to_none=True)
         (l + lf).backward()
@@ -787,6 +850,15 @@ def train(a):
                                      zp=zp(va[j:j + 1024]), dk=dkf(va[j:j + 1024]), **vk(va[j:j + 1024])) for j in range(0, len(va), 1024)])
             m, m2 = metrics(out, A[va], st), metrics(out[:, :2], A[va, :2], st)
             xr = ""
+            if rtd:  # val：第 2–3 个路点（延迟 2 个路点时实际执行的那两个），不给前缀 / 给真值前缀 d = 2
+                with torch.no_grad(), amp():
+                    op = []
+                    for g_ in va.split(1024):
+                        net.rtc_pre = (ytgt(A[g_], st)[:, :2], torch.full((len(g_),), 2, device=dev))
+                        op.append(net(fz(zi(g_)), *txt(g_), zw=zw(g_), zp=zp(g_), dk=dkf(g_)))
+                    net.rtc_pre = None
+                    op = torch.cat(op)
+                xr += f"  val[2:4] 无前缀 {metrics(out[:, 2:4], A[va, 2:4], st)['nmse']:.4f} / 真值前缀 d=2 {metrics(op[:, 2:4], A[va, 2:4], st)['nmse']:.4f}"
             if vh is not None:  # (vpp) 隐状态全 0（= 去掉隐状态，只剩历史帧 [+ 计划] + 本体）的对照：看 IDM 用了多少 WM 隐状态的信息
                 with torch.no_grad(), amp():
                     o0 = torch.cat([net(zi(g), zp=zp(g), zh=torch.zeros(len(g), a.H, ck["dims"][1], a.vpp_d, device=dev, dtype=torch.bfloat16)) for g in va.split(1024)])
@@ -952,6 +1024,9 @@ def main():
     a("--vpp_new", type=int, default=0, help="(vpp) 每步新算隐状态的帧数（< bs 时用环形缓冲，每个隐状态连用 bs / vpp_new 步，省 WM 前向）；0 = bs（不复用）")
     a("--vpp_val", type=int, default=2048, help="(vpp) val 只用固定的这么多帧（每帧一次 WM 前向）"); a("--vpp_chunk", type=int, default=64, help="(vpp) WM 前向的分块大小（显存）")
     a("--vpp_compile", type=int, default=1, help="(vpp) 1 = WM 的 trunk 用 torch.compile（训练时出隐状态）；0 = eager")
+    a("--rtc_dmax", type=int, default=0, help="train >0：训练时 RTC——每个样本随机取前缀长度 d（见 --rtc_p0），动作块前 d 个路点用真值、层级 1（不加噪）、加零初始化的前缀掩码嵌入，"
+                                               "只在其余位置算 flow 损失；推理由 closed_loop Policy.rtc_prefix（仿真：robotwin_eval --sim_delay / --rtc）给已发出的路点作前缀；只接 flow 头；默认 0 = 关")
+    a("--rtc_p0", type=float, default=1 / 3, help="--rtc_dmax 时 d = 0 的概率（其余在 1..rtc_dmax 均匀）")
     e = p.parse_args()
     torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = True
     if e.cmd == "train":

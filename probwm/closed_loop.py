@@ -666,6 +666,24 @@ class Policy:
         out = torch.stack([o0] + eo).mean(0)
         return (out, [o0] + eo) if every else out
 
+    def rtc_prefix(s, P=None, dv=None):
+        """训练时 RTC 的 IDM（idm train --rtc_dmax）：设好后，之后每次 act 输出的动作块前 dv[b] 个路点固定为 P[b, :dv[b]]，其余路点接着这个前缀生成。
+        P：(B, d, ad) 原始动作单位（同 act 的输出），= 拍下这一帧之后、新动作块生效之前机器人还会执行的已下发路点，按时间先后；
+        dv：(B,) 整数，各样本的有效前缀长度（≤ d；0 = 该样本不给前缀，如新回合的第一次决策）。B 与 act 的批大小、样本顺序相同。
+        主 IDM 与 --idm_ens 各成员用同一前缀（集成平均后前缀位仍是前缀）。P=None 或 dv 全为 0 时清除（= 原行为，策略输出逐位不变）。
+        与 --graphs / --idm_graph / --idm_ms / --compile 都可同用；不与 --idm_ens_par、--act_roll 同用。用法：每次决策 act 前设、act 后 rtc_prefix(None)。"""
+        pre = None
+        dv = None if dv is None else np.asarray(dv.cpu() if torch.is_tensor(dv) else dv).astype(np.int64).reshape(-1)  # 在 CPU 上判有没有前缀（不引入 GPU 同步）
+        if P is not None and dv is not None and bool((dv > 0).any()):
+            assert s.ens_par is None and s.a.policy == "wm+idm", "rtc 前缀只接 wm+idm（不与 --idm_ens_par 同用）"
+            P = P.to(s.dev, torch.float) if torch.is_tensor(P) else torch.as_tensor(np.asarray(P), dtype=torch.float, device=s.dev)
+            assert P.dim() == 3 and P.shape[0] == len(dv) and P.shape[2] == s.net.ad and int(dv.max()) <= P.shape[1] < s.net.n_act, \
+                f"rtc 前缀形状不对：P {tuple(P.shape)}，dv 最大 {int(dv.max())}，动作块 {s.net.n_act} × {s.net.ad}"
+            pre = (s.idm.ytgt(P, s.st), torch.as_tensor(dv, device=s.dev))
+        for n_ in [s.net] + s.enets:
+            assert pre is None or hasattr(n_, "pemb"), "rtc 前缀要用 idm train --rtc_dmax 训练的 IDM（主 IDM 与 --idm_ens 成员都要）"
+            n_.rtc_pre = pre
+
     def accel(s, obj, tag, *names):  # --compile：tag 在 --compile_on 里的模块，把这些方法 torch.compile（在 --graphs 捕获之前；默认关 = 不动）
         a = s.a
         if tag and getattr(a, "compile", "") and tag in (getattr(a, "compile_on", "") or "").split(","):

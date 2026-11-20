@@ -276,6 +276,11 @@ def main():
     a("--fixed_noise", action="store_true", help="flow 动作头每个 episode 固定一份初始噪声（相邻决策落在同一模态）")
     a("--act_roll", type=float, default=0.0, help=">0：动作滚动——上一个动作块平移 --exec 个路点（尾部补最后一个）加噪到 τ0 = 这个值作初值再去噪")
     a("--ensemble", type=float, default=-1, help="≥0：ACT 式时间集成的 m（权重 exp(−m·i)，i = 0 为最早的预测；ACT 用 0.01）；<0 关")
+    a("--sim_delay", type=int, default=0, help="仿真推理延迟 d 个路点（异步执行的参考）：拿到观测、开始算新动作块时，机器人照上一块再执行 d 个路点（已发出，新块改不了），"
+                                               "新块从第 d 位接上；每次决策间仍执行 --exec 个路点，新回合的第一块没有前缀（等它算完再动）；"
+                                               "--ensemble 按绝对路点时刻对齐（只集成新发出的那几位）；只接 wm+idm；默认 0 = 同步执行（原行为）")
+    a("--rtc", action="store_true", help="配 --sim_delay：把这 d 个已发出的路点作前缀喂给训练时 RTC 的 IDM（closed_loop Policy.rtc_prefix；--idm / --idm_ens 都须是 "
+                                         "idm train --rtc_dmax 训的）；不开 = 过期路点直接跳过；d = 0 时等价于不开")
     a("--obs_every", type=int, default=0, help="--exec 大于它时，执行动作段的中途每这么多个路点也拍一帧补进历史（历史帧间隔与训练一致，2）；BC，或 (rteasy) wm+idm 的 MSF 滚动（缓存每次决策平移 exec / 2 帧）")
     a("--video", type=int, default=0, help="每任务前这么多个 episode 存下策略看到的头部帧和动作（<out 去掉 .json>_video/<任务>_<种子>.npz，看失败方式用）")
     a("--n_env", type=int, default=20); a("--sim_gpus", default="", help="worker 的 CUDA_VISIBLE_DEVICES（轮流分配），空 = 继承")
@@ -330,6 +335,10 @@ def main():
         os.environ["RT_INSTR"] = a.instr
     assert not a.oracle_plan or (a.policy == "wm+idm" and a.roll and not a.log_roll), "--oracle_plan 只接 wm+idm 的 --roll 路径"
     assert not (a.idm_ens or a.n_avg > 1) or not (a.fixed_noise or a.act_roll > 0 or a.grip_idm or a.wm_act), "--idm_ens 不与 --fixed_noise / --act_roll / --grip_idm / --wm_act 同用"
+    assert a.sim_delay >= 0 and (not a.sim_delay or (a.policy == "wm+idm" and not (a.ph2 or a.act_roll > 0 or a.oracle_plan or a.log_roll or a.replan or a.ens_gwin or a.ens_contact
+                                                                                    or a.grip_idm or a.exec > a.obs_every > 0))), \
+        "--sim_delay 只接 wm+idm，不与 --ph2 / --act_roll / --oracle_plan / --log_roll / --replan / --ens_gwin / --ens_contact / --grip_idm / --obs_every 同用"
+    assert not a.rtc or not a.idm_ens_par, "--rtc 不与 --idm_ens_par 同用"
     if a.merge:
         return summarize([e for f in a.merge for e in json.loads(Path(f).read_text())["episodes"]])
     torch.manual_seed(a.seed)
@@ -494,6 +503,7 @@ def main():
     vid, nvid = [None] * n, {}  # --video：在录的 episode 帧、各任务已存的个数
     pend = [[] for _ in range(n)]  # --obs_every：待补进历史的中途帧
     ens = [[] for _ in range(n)]  # --ensemble：各 env 历次预测里还没执行到的部分（动作块, 年龄）
+    dq = [None] * n  # --sim_delay：各 env 已发出、下一次决策推理期间会执行的 d 个路点（原始单位）
     ctv = [float(x) for x in a.ens_contact.split(",")] if a.ens_contact else []  # (prec) --ens_contact：W, thr, ahead, after
     ctv += [0.1, 8, 3][len(ctv) - 1:] if ctv else []
     cdn, cq, cnt_ct = [0] * n, [None] * n, [[0, 0] for _ in range(n)]  # (prec) 夹爪在动后的倒计数、上次决策的 qpos、本 episode [接触决策数, 决策数]
@@ -680,7 +690,15 @@ def main():
                     pol.orc_d = {w: orcJ[w] for w in act_ if w in orcF}
                 elif a.oracle_plan == "tf":
                     pol.orc_far = {w: (orcF[w], orcJ[w]) for w in act_ if w in orcF}
+            if a.rtc and a.sim_delay:  # 推理期间照上一块执行的 d 个路点（已发出）作 IDM 的动作前缀；新回合的第一次决策没有前缀
+                Pp, dv_ = np.zeros((len(act_), a.sim_delay, pol.net.ad), np.float32), np.zeros(len(act_), np.int64)
+                for i, w in enumerate(act_):
+                    if not fresh[w] and dq[w] is not None:
+                        Pp[i, :len(dq[w])], dv_[i] = dq[w], len(dq[w])
+                pol.rtc_prefix(Pp, dv_)
             acts = pol.act(h, ti, idx, fr.flatten(), wh, ph)
+            if a.rtc and a.sim_delay:
+                pol.rtc_prefix(None)
             if a.roll_k > 1 and getattr(pol, "plan_div", None) is not None:  # (rteasy) K 计划分歧度（新 episode 的第一次决策是同步采样，不记）
                 dv_ = pol.plan_div.float().cpu().numpy()
                 for i, w in enumerate(act_):
@@ -722,8 +740,8 @@ def main():
             for i, w in enumerate(act_):
                 if fresh[w]:
                     ens[w] = []
-                ens[w] = [(c[a.exec:], g + 1) for c, g in ens[w] if len(c) > a.exec] + [(acts[i], 0)]
-                L = min(a.exec, len(acts[i]))
+                ens[w] = [(c[a.exec:], g + 1) for c, g in ens[w] if len(c) > a.exec] + [(acts[i].copy() if a.sim_delay else acts[i], 0)]  # --sim_delay：存原块（下一行起会就地改写前 exec + d 位）
+                L = min(a.exec + a.sim_delay, len(acts[i]))  # --sim_delay：要发出的是第 d..d+exec−1 位（新回合第 0..exec+d−1 位），都按绝对时刻集成
                 num, den = np.zeros_like(acts[i, :L]), np.zeros((L, 1), np.float32)
                 for c, g in ens[w]:  # g = 这次预测的"年龄"（决策数），最老的权重最大（同 ACT）
                     k = min(L, len(c))
@@ -757,6 +775,11 @@ def main():
                         if ct_:
                             acts[i, :L] = sub(int(ctv[0]))
         for i, w in enumerate(act_):
+            if a.sim_delay:  # 这一段执行 = 已发出的 d 个路点 + 新块第 d 位起；剩下 d 个留给下一次推理期间执行。acts[i, :exec] 改成实际发出的（录像照记）
+                if fresh[w] or dq[w] is None:
+                    dq[w] = acts[i, :0]
+                cmb = np.concatenate([dq[w], acts[i, len(dq[w]):a.exec + a.sim_delay]])
+                acts[i, :a.exec], dq[w] = cmb[:a.exec], cmb[a.exec:].copy()
             pipes[w].send(("step", (job[w][0], acts[i, :a.exec])))
             fresh[w] = False
             if a.ph2:

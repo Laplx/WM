@@ -18,6 +18,7 @@ FAST=1 bash scripts/run_robotwin.sh wc2-fast --tasks handover_block --cfg demo_c
 
 - 模式：`w40-canon`（W40 WM + 独立 canon）、`wc2`（WC2 WM，规范化由 WM 的 t+0 槽承担）、`wc2-fast`（同 WC2，加 `--idm_stale obs` 的高效推理）。三者共用三个腕部 IDM（三个训练种子等权集成）。
 - `FAST=1` 另开三个只改速度、不改策略输出的选项（见"时延"）。
+- `RTC=1` 把三个腕部 IDM 换成训练时 RTC 的版本（`$WMRUNS/rtc/idmPLwrR*.pt`，异步执行时用），配 `--sim_delay d [--rtc]` 在仿真里模拟异步执行；默认不用，见 docs/real_robot.md 第 9 节。
 - 权重单独分发。参考加载器还使用 `WMDATA` 下的 `feats/dinov3_vits16hwf/info.json`、`meta/tasks.json`、`text/flan-t5-large_seen64.pt`。预训练编码器为 `facebook/dinov3-vits16-pretrain-lvd1689m` 和 `google/flan-t5-large`。
 
 ## 每次决策做什么
@@ -48,7 +49,7 @@ FAST=1 bash scripts/run_robotwin.sh wc2-fast --tasks handover_block --cfg demo_c
 1. 先在机旁的卡上用 `scripts/latency.py --prof` 实测，确认关键路径与每次决策的全部计算是否满足上面两条节奏条件。
 2. 出现抖动时，先定位最早出现的层：同一关节画"预测动作块 → 发布目标 → 实测反馈"，一次只改一个因素。
 3. WM 算不过来（每次决策的计算超过 1 个 WM 帧间隔）时的办法：训练时加大取帧间隔、保持 `--exec 2`，拉长决策间隔；或换更快的卡。关掉语言 CFG 能让 WM 计算约减半，但对效果的影响没有验证过。
-4. RTC：默认同步执行加时间集成（`--ensemble 0.01`），不需要 RTC。改成异步执行（边执行旧动作块边算新块）时，按时间戳对齐、丢掉新块里已过期的路点即可：仿真里延迟 2 个路点时这样做表现不变。训练时 RTC（IDM 增加"已发出动作前缀"输入）在仿真里不伤同步执行，但延迟 2 个路点时没有带来改进，不建议默认使用（本仓库不含该功能）；它只让换块处的跳变变小，真机若异步后在换块处出现明显抖动再考虑。异步后的决策节奏也要与 WM 的取帧间隔、滚动缓存一致。
+4. RTC：默认同步执行加时间集成（`--ensemble 0.01`），不需要 RTC。改成异步执行（边执行旧动作块边算新块）时，按时间戳对齐、丢掉新块里已过期的路点即可：仿真里延迟 2 个路点时这样做表现不变。训练时 RTC（IDM 增加"已发出动作前缀"输入）在仿真里不伤同步执行，但延迟 2 个路点时没有带来改进，不建议默认使用；它只让换块处的跳变变小，真机若异步后在换块处出现明显抖动再考虑（训练与推理接口、怎么由延迟定 d，见 [docs/real_robot.md](docs/real_robot.md) 第 9 节）。异步后的决策节奏也要与 WM 的取帧间隔、滚动缓存一致。
 
 ## 训练和真机对接
 
