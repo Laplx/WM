@@ -45,13 +45,13 @@ HDF5 里存的是路点频率的序列（见第 3 节），建根时 `--stride 2
 ```
 
 - 三路图像与关节位置逐帧对齐（同一时刻，按时间戳取最近帧）。分辨率任意，建根与编码时按 `to256` 非等比缩放到 256×256（仿真是 320×240 拉伸），与推理时相同。
-- 划分：建根时 episode 编号 ≥ 45 的记为验证集。数据少于约 50 条时，改 `probwm/render_robotwin.py` 里 `_legacy_task` 的 `split=int(k >= …)` 阈值，留出约 10% 的轨迹作验证。
+- 划分：建根时 episode 编号 ≥ `--val_from`（默认 45）的记为验证集。按条数设，留出约 10% 作验证，例如 50 条时 `--val_from 45`；用第 4 节的图像增强副本时取脚本打印的值。
 
 ## 4. 建根与编码
 
 ```bash
 D=/path/to/real_root_built          # 输出的数据根
-python -m probwm.render_robotwin legacy --out $D --clean_root /path/to/真机根 --tasks <任务名> --P 4 --stride 2 --workers 8
+python -m probwm.render_robotwin legacy --out $D --clean_root /path/to/真机根 --tasks <任务名> --P 4 --stride 2 --workers 8 --val_from 45
 for k in rgb wl wr; do               # 头部、左腕、右腕，都是 16×16 全分辨率（不加 --pool）
   python -m probwm.encode --data $D --key $k --alloc --parts 1
   python -m probwm.encode --data $D --key $k --src_h5 --shard 0 --nshard 1 --workers 8 --bs 256
@@ -63,6 +63,20 @@ cp $WMDATA/feats/dinov3_vits16hwf/info.json $D/feats/dinov3_vits16hwf/   # 三�
 
 得到 `meta/`（索引、动作、本体、指令）、`h5/`（路点频率的完整动作，给 IDM）、`feats/`（三路特征与三视图定义）、`text/flan-t5-large_seen64.pt`。
 
+### 可选：离线图像增强副本
+
+仿真权重训练时只在特征 / 条件层面加了扰动（WM 的文本嵌入噪声 `--txt_noise 0.3` 与 10% 语言丢弃、IDM 的输入特征噪声 `--noise 0.1`，上面的命令已包含），没有做图像层面的增强；仿真的"随机化"数据是仿真器直接生成的场景，真机上没有对应物。真机数据少、画面单一，可以在建根之前给每条训练 episode 生成 K 份图像增强副本：
+
+```bash
+python scripts/aug_legacy.py --src /path/to/真机根 --dst /path/to/增强根 --tasks <任务名> --k 4 --n_val 5 --workers 8
+# 最后一行打印 "--val_from N"；建根时把 --clean_root 换成增强根、--val_from 换成 N，其余命令不变
+```
+
+- 每份副本、每路相机抽一组参数，整条 episode 内所有帧相同（WM 要预测未来帧的特征，逐帧随机会让它去学预测抖动）：亮度 / 对比度 / 饱和度 ±20%、色调 ±3%，放大 0–8%、平移 ±5%、旋转 ±3°（反射填边）。`--no_geo` 只做颜色，`--geo_wrist 0` 腕部只做颜色。参数记在增强根的 `<任务>/aug_map.json`。
+- 验证 episode 原样放在最后、不增强；动作、本体、末端位姿原样复制，不做镜像这类会改变关节含义的增强。
+- 作用：对光照、相机位姿的小偏差、轻微遮挡更鲁棒；同样步数下每条原始示范被重复的轮数变少，过拟合也少一些。它改变不了物体之间的相对位置，应对摆放变化仍要靠示范本身覆盖更多初始位置。
+- 代价：K = 4 时训练集特征约为原来的 5 倍（35 分钟数据约 40 GB）。这一项没有在仿真里验证过，建议做 / 不做各训一版，比较验证损失与第 8 节的离线回放。
+
 ## 5. 微调 WM（从 WC2 出发）
 
 ```bash
@@ -70,12 +84,22 @@ W=$WMRUNS/rteasy/wmX2F5Clw3WC2/ckpt.pt
 python -m probwm.train --data $D --suites '' --text flan-t5-large_seen64 --mode abs --K 4 --roll 0.5 --roll_sort --hw 0.5 \
   --far_clamp 8 --alpha 13 --txt_noise 0.3 --p_main 0 --seed 0 --encoder dinov3_vits16hwf --tgt_tok 256 --xin_zero --xtok_last \
   --d 1280 --depth 12 --heads 20 --n_fut 14 --tgt_offs 0,1,2,3,4,5,6,7,8,16,24,32,48,64 --canon_slot --lw_motion 3 --lw_slot \
-  --init $W --init_offs --norm_from $W --lr 3e-5 --warmup 200 --steps 3000 --bs 8 --accum 8 --out runs/wm_real
+  --init $W --init_offs --norm_from $W --lr 3e-5 --warmup 200 --steps 4000 --bs 8 --accum 8 \
+  --log 100 --save 500 --keep 1000,1500,2000,2500,3000,3500 --out runs/wm_real
 ```
 
-- 以上与训练 WC2 时的配置逐项相同，只改数据根、步数和批的切法（全局批 64 = `--bs 8 --accum 8`）。`--norm_from` 沿用仿真权重的特征归一化。
-- 热启动一律用小学习率（3e-5）、短 warmup；大学习率会把模型踢出原来的极小点。
-- 步数按数据量定：单任务数据少，先训 2–5k 步，看验证损失和第 7 节的离线回放，再决定是否加训。不加 `--trainval`，保留验证集。
+- 以上与训练 WC2 时的配置逐项相同，只改数据根、步数、日志 / 存点间隔和批的切法（全局批 64 = `--bs 8 --accum 8`）。`--norm_from` 沿用仿真权重的特征归一化。
+- 热启动一律用小学习率（3e-5）、短 warmup；大学习率会把模型踢出原来的极小点。不加 `--trainval`，保留验证集。
+- 存下的是 EMA 权重（`--ema 0.999`，时间常数约 1000 步）；`--keep` 另存 `ckpt_s<步>.pt`，最后一步存 `ckpt.pt`。
+
+**训多少步**：按"轮数"定，不按固定步数。1 轮 ≈ 训练集 WM 帧数 ÷ 64 步；单任务、从仿真权重热启动时 10–20 轮通常够，再多容易背下示范的布局和轨迹（仿真里续训越久，语言和改写指令越差）。
+
+例：50 条示范、共约 35 分钟，30 Hz 录制、按 15 Hz 存路点（第 1 节）：
+- WM 帧 ≈ 35 × 60 × 7.5 ≈ 1.6 万；`--val_from 45` 留 5 条验证后，训练集约 1.4 万帧，1 轮 ≈ 220 步。
+- 不做图像增强：`--steps 4000`（约 18 轮），每 500 步存一份，同上面的命令。
+- 做图像增强（K = 4）：训练集约 7 万帧，1 轮 ≈ 1100 步；`--steps 6000 --keep 2000,3000,4000,5000`。
+
+**挑哪一份**：日志每 `--log` 步打印一次 `val(ema)`（单个验证批，噪声大），取相邻 5 次的平均看走势，选平均值不再下降的最早那一份（通常在 2–3k 步）；再对它和后一份各做一次第 8 节的离线回放，选回放更好的。若到最后一份验证损失仍在明显下降，把 `--steps` 改到约 6000 重训（不增强时）。
 - 真机数据没有仿真里的随机化配对，`--canon_slot` 的 t+0 目标就是该帧本身。
 - 也可以从 W40（`wmX2F5Clw3W`）出发：去掉 `--canon_slot`、`--tgt_offs` 和 `--n_fut` 改成 W40 的 13 槽（`1,…,8,16,24,32,48,64`）。独立 canon 是在仿真随机化配对上训的，真机画面上没有对应的配对数据，首轮建议用 WC2。
 
@@ -86,12 +110,13 @@ for s in 0 1 2; do
   I=$WMRUNS/rteasy/idmPLwr$([ $s = 0 ] || echo s$s).pt
   PROBWM_FEATS_MMAP=1 python -m probwm.idm train --kind idm --ih 3 --d 768 --depth 6 --H 8 --head flow --proprio qpos \
     --data $D --h5 $D/h5 --wm runs/wm_real/ckpt.pt --wrist 1 --wkeys wl,wr --seed $s \
-    --init $I --lr 3e-5 --steps 3000 --out runs/idm_real_s$s.pt
+    --init $I --lr 3e-5 --steps 1500 --log 100 --out runs/idm_real_s$s.pt
 done
 ```
 
-- 结构参数与仿真的三个腕部 IDM 相同（`torch.load(ckpt)["args"]` 可查全部），`--init` 从对应种子出发。`--wm` 只用来取数据根与头部特征的归一化，指向微调后的 WM，与推理时一致。
+- 结构参数与仿真的三个腕部 IDM 相同（`torch.load(ckpt)["args"]` 可查全部），`--init` 从对应种子出发。`--wm` 只用来取数据根与头部特征的归一化，指向挑出来的那份 WM，与推理时一致。
 - 先只适配并验证种子 0 的单个 IDM；效果正常再训另两个，推理时用 `--idm … --idm_ens …` 做三者集成。
+- 步数：IDM 批 256，1 轮 ≈ 训练集 WM 帧数 ÷ 256 步。上面的例子里 1 轮约 55 步，`--steps 1500` 约 27 轮；做图像增强时用 `--steps 2500`。IDM 只在结束时存一份，日志里 `val nmse` 若在最后几百步回升，减少步数重训（单次只要十几分钟）。输入特征噪声 `--noise 0.1` 是默认值，不要关。
 - 核对每个关节和夹爪的语义、量程与仿真一致。
 
 ## 7. 动作平滑与抖动

@@ -572,7 +572,8 @@ def _xpl_demo(p):  # XPolicyLab HDF5 的小数组：qpos (T,14)、action (T,14)�
 
 def _legacy_task(job):  # 一个任务的全部来源：小数组 + 指令（不读图像）
     import h5py
-    task, srcs, stride = job
+    task, srcs, stride = job[:3]
+    vf = job[3] if len(job) > 3 else 45  # clean / ours 来源：编号 ≥ vf 的 episode 记为验证集（--val_from）
     out = []
     for src, d in srcs:
         if src == "dr":  # 我们的 DR 重渲染（协议 B）：d = "<RoboTwin data 根>|<drfast 根>"；每个 (v, k) 先找 dr_one 的 HDF5 版，再找 dr_fast 的 npz 版
@@ -626,11 +627,11 @@ def _legacy_task(job):  # 一个任务的全部来源：小数组 + 指令（不
             idx = np.arange(0, len(q), stride)
             out.append(dict(task=task, src=src, k=k, demo=OFF[src] + k, path=p,
                             q=q[idx], a=a[idx], a_full=a, ee=[e[idx] for e in ee], seen=ins["seen"], unseen=ins.get("unseen", []),
-                            split=int(k >= (450 if src == "rand" else 45))))
+                            split=int(k >= (450 if src == "rand" else vf))))
     return task, out
 
 
-def legacy(out, srcs, tasks, stride=2, img=256, P=8, workers=32):
+def legacy(out, srcs, tasks, stride=2, img=256, P=8, workers=32, val_from=45):
     """官方 legacy 数据 → <out>/{meta/(index.npz, tasks.json, actions.npy, success.npy, states/{qpos,left_ee,right_ee}.npy, langs.json,
     langs_aug.json, src_h5.json), h5/robotwin/<task>_demo.hdf5}。srcs：[(来源名 clean | rand, 解开后的根目录)]。帧序：任务名 → 来源（clean 先）→ k。
     split：clean k ≥ 45、rand k ≥ 450 为 val（最终 --trainval）。指令表：每条 demo 一行 = 它自己的前 P 条 seen 指令。"""
@@ -639,7 +640,7 @@ def legacy(out, srcs, tasks, stride=2, img=256, P=8, workers=32):
     for x in (mdir, sdir, hdir):
         os.makedirs(x, exist_ok=True)
     with mp.get_context("spawn").Pool(min(workers, len(tasks))) as pool:
-        res = dict(pool.imap_unordered(_legacy_task, [(t, srcs, stride) for t in tasks]))
+        res = dict(pool.imap_unordered(_legacy_task, [(t, srcs, stride, val_from) for t in tasks]))
     tasks = sorted(tasks)
     bad = 0
     for t in tasks:  # DR 版与同 k 的 clean 帧数必须一致（canon 逐帧配对；回放偏离的去掉）
@@ -810,6 +811,7 @@ def main():
     p.add_argument("--ours_root", default="", help="legacy：改用我们自己按官方脚本采的 clean（XPolicyLab 格式，RoboTwin data/demo_clean），代替 --clean_root")
     p.add_argument("--dr_root", default="", help="legacy：加我们的 DR 重渲染（协议 B）：<RoboTwin data 根>|<drfast 根>")
     p.add_argument("--P", type=int, default=8, help="legacy：每条 demo 的指令表取前 P 条 seen 指令")
+    p.add_argument("--val_from", type=int, default=45, help="legacy：clean / ours 来源里编号 ≥ 这个值的 episode 记为验证集（真机数据按条数设；用 scripts/aug_legacy.py 时取它打印的值）")
     p.add_argument("--out", default="data_robotwin")
     p.add_argument("--tasks", nargs="+", default=list(PILOT))
     p.add_argument("--src", nargs="+", default=["demo_clean"], help="convert：来源配置（demo_clean、ours_dr1 …）；dr：被回放的 clean 配置取第一个")
@@ -840,7 +842,7 @@ def main():
             + ([("dr", a.dr_root)] if a.dr_root else [])
         r0 = srcs[0][1]
         tasks = sorted(x for x in os.listdir(r0) if os.path.isdir(os.path.join(r0, x))) if a.tasks == ["all"] else a.tasks
-        return legacy(a.out, srcs, tasks, a.stride, a.img, a.P, a.workers)
+        return legacy(a.out, srcs, tasks, a.stride, a.img, a.P, a.workers, a.val_from)
     if a.cmd in ("collect", "dr", "drfast"):  # 带超时的 worker（--timeout 秒，卡死的进程杀掉换新）
         rt_path()
         W, t0 = Workers(a.workers, a.timeout, [g for g in a.gpus.split(",") if g], a.recycle), time.time()
