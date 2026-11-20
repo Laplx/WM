@@ -14,6 +14,7 @@ meta/actions.npy 只存了 a_{2k}，完整的 20 Hz 动作从原始 hdf5 读取�
 训练时随机取 --wm 的改写增广表里的一条、文本嵌入加相对 RMS 的高斯噪声（同 train.py tx()），val 用原指令。
 --head flow：π0 式动作专家，用线性 flow matching 生成整个动作块（2H 个，6 维标准化连续量 + 夹爪 ±1 一起作为 7 维流输出，推理取符号）；
 带噪动作 token（AdaLN(τ)）经交叉注意力读骨干输出（KV 每次决策只算一次），Euler --fsteps 步。--H 8 时条件为 WM 的整个 8 帧计划。
+--wpf N（降频档，默认关）：IDM 的一帧 = N 个路点（数据根不变，按 delta = N/2 隔帧取），动作块 = N·H 个路点；配 train --delta N/2 的 WM，闭环每次决策执行 N 个路点。
 --rtc_dmax D（训练时 RTC，默认关）：flow 头另学"已发出动作前缀"条件——训练时每个样本随机取前缀长度 d ∈ {0..D}，动作块前 d 个路点用真值、
 层级 1（不加噪）、加零初始化的前缀掩码嵌入 pemb，只在其余位置算 flow 损失；推理时 Net.rtc_pre（closed_loop Policy.rtc_prefix 设）给前缀，
 输出的前 d 个路点就是前缀、其余接着生成。不给前缀时与原网络逐位相同。
@@ -547,11 +548,14 @@ def metrics(out, act, st):
             "nmse_dim": (e / st["sd"] ** 2).flatten(0, -2).mean(0).tolist()}
 
 
-def setup(wm_path, h5, H, dev, suites=None, root="", zpad=False):  # suites 非空：只载入这些 suite（norm 仍用 WM ckpt 里的）；root：换数据根（norm 仍用这个 WM 的）；zpad：见 load_actions
+def setup(wm_path, h5, H, dev, suites=None, root="", zpad=False, wpf=0):  # suites 非空：只载入这些 suite（norm 仍用 WM ckpt 里的）；root：换数据根（norm 仍用这个 WM 的）；zpad：见 load_actions
     ck = torch.load(wm_path, map_location="cpu")
     wa = Namespace(**ck["args"])
     wa.suites = wa.suites if suites is None else suites
     wa.data = root or wa.data
+    if wpf:  # --wpf（降频档）：IDM 的一帧 = wpf 个路点。数据根不变（帧 k ↔ a_{STRIDE·k}），按 delta = wpf / STRIDE 隔帧取（同 train --delta）
+        assert wpf % STRIDE == 0 and getattr(wa, "delta", 1) in (1, wpf // STRIDE), f"--wpf {wpf} 须是 {STRIDE} 的倍数，--wm 的 delta 须为 1 或 wpf / {STRIDE}"
+        wa.delta = wpf // STRIDE
     data = load_data(wa, dev, ck["norm"])
     return ck, wa, data, load_actions(data, wa, h5, STRIDE * wa.delta * H, zpad)
 
@@ -560,7 +564,8 @@ def train(a):
     dev = torch.device("cuda")
     torch.manual_seed(a.seed)
     em = getattr(a, "end_min", 0)  # (mika) --end_min h：训练 / val 帧只要求 h 帧未来在 demo 内（超出的计划帧取最后一帧、动作 6 维置 0）；0 = 原行为（要求 H 帧）
-    ck, wa, data, A = setup(a.wm, a.h5, a.H, dev, a.suites or None, getattr(a, "data", ""), zpad=em > 0)
+    assert (getattr(a, "wpf", 0) or 2) == 2 or not (getattr(a, "rtc_dmax", 0) or 0), "降频档（--wpf ≠ 2）不与 --rtc_dmax 同用（没有验证过）"
+    ck, wa, data, A = setup(a.wm, a.h5, a.H, dev, a.suites or None, getattr(a, "data", ""), zpad=em > 0, wpf=getattr(a, "wpf", 0) or 0)  # --wpf：帧—路点比
     Hf = em if em > 0 else max([a.H] + fars(a))  # --far：要求 z_{t+far} 在 demo 内
     tr, va, lab = frames(data, 0, Hf, False), frames(data, 1, Hf, True), labeled(data, a.n_demo)
     if a.trainval:  # 每任务 50 条 demo 全部训练（val 只作监控）
@@ -898,7 +903,7 @@ def evaluate(a):
     idm, ia, st = make(ick, dev)
     idm.steps = a.fsteps or idm.steps
     Hv = max([ia.H, a.Hv] + fars(ia))  # anchor 集要求有 Hv 帧未来：不同 H 的 IDM 用 --Hv 8 在同一批 anchor 上比较
-    ck, wa, data, A = setup(a.wm or ick["wm"], a.h5, Hv, dev)
+    ck, wa, data, A = setup(a.wm or ick["wm"], a.h5, Hv, dev, wpf=getattr(ia, "wpf", 0) or 0)  # 按 IDM 训练时的帧—路点比取帧
     A = A[:, :ick["n_act"]]
     wm = build(wa, ck["dims"]).to(dev).eval()
     wm.load_state_dict(ck["model"])
@@ -1027,6 +1032,9 @@ def main():
     a("--rtc_dmax", type=int, default=0, help="train >0：训练时 RTC——每个样本随机取前缀长度 d（见 --rtc_p0），动作块前 d 个路点用真值、层级 1（不加噪）、加零初始化的前缀掩码嵌入，"
                                                "只在其余位置算 flow 损失；推理由 closed_loop Policy.rtc_prefix（仿真：robotwin_eval --sim_delay / --rtc）给已发出的路点作前缀；只接 flow 头；默认 0 = 关")
     a("--rtc_p0", type=float, default=1 / 3, help="--rtc_dmax 时 d = 0 的概率（其余在 1..rtc_dmax 均匀）")
+    a("--wpf", type=int, default=0, help="降频档：帧—路点比，IDM 的一帧 = 这么多个路点（须是 STRIDE 的倍数，如 4）。数据根不变（帧 k ↔ a_{2k}），按 delta = wpf / 2 隔帧取"
+                                         "（同 train --delta）：历史 / 未来 / 本体 / 腕部帧间隔都是 wpf 个路点，动作块 = wpf·H 个路点（--wpf 4 配 --H 4 = 16 个路点）；存进 ckpt args，"
+                                         "推理时 Policy / robotwin_eval 从 IDM ckpt 读（每次决策执行 wpf 个路点、滚动缓存每次平移 1 帧）；WM 须用 train --delta wpf/2 训；默认 0 = 2（原行为）")
     e = p.parse_args()
     torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = True
     if e.cmd == "train":

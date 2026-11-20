@@ -264,7 +264,7 @@ def main():
     a("--poe", default="", help="w[,steps[,thr]]：门控 PoE（closed_loop --poe，需 --canon、--prior）"); a("--prior", default="runs/rt/prior/ckpt.pt")
     a("--cfg", default="demo_clean", help="demo_clean = Easy，demo_randomized = Hard")
     a("--tasks", default=",".join(PILOT)); a("--n_ep", type=int, default=100); a("--seed", type=int, default=0, help="官方 seed：种子从 100000·(1+seed) 起")
-    a("--exec", type=int, default=2, help="每次决策执行的路点数（2 = 一个 WM 帧）")
+    a("--exec", type=int, default=2, help="每次决策执行的路点数（2 = 一个 WM 帧）；降频档（IDM 用 idm --wpf N 训）须为 N（如 4），WM 帧也是 N 个路点")
     a("--roll", default="", help="滚动去噪（closed_loop --roll）；MSF / MSN 用 1,0,8")
     a("--obs", default="cams", choices=["cams", "full"], help="cams：只拍策略要用的相机（默认）；full：官方 get_obs（全部相机）")
     a("--jpeg", default="", choices=["", "legacy", "std"], help="观测先过一遍训练数据同款 JPEG：legacy = 官方数据集，std = 我们按官方脚本采的（XPolicyLab）")
@@ -354,6 +354,9 @@ def main():
     keys = ["rgb"] + (["wl", "wr"] if (pargs.get("wrist", 0) > 0 and not eec) or xw else [])
     prop = bool(pargs.get("proprio"))
     assert not prop or pargs["proprio"] == "qpos", "RoboTwin 的本体感觉只有 qpos（14 维，同 get_obs 的 joint_action/vector）"
+    wpf = int(pargs.get("wpf", 0) or 2) if a.policy == "wm+idm" else 2  # 降频档：帧—路点比（idm train --wpf；旧 ckpt = 2），每次决策的历史帧间隔须恰为 1 个 WM 帧
+    assert wpf == 2 or (a.exec % wpf == 0 and (a.exec == wpf or a.obs_every == wpf) and not (a.ph2 or a.oracle_plan or a.sim_delay or a.rtc or a.log_roll)), \
+        f"降频档：IDM 的一帧 = {wpf} 个路点，--exec 须为 {wpf}（或 {wpf} 的倍数配 --obs_every {wpf}），不与 --ph2 / --oracle_plan / --sim_delay / --rtc / --log_roll 同用"
 
     n, ctx = a.n_env, mp.get_context("spawn")
     gl, env0 = [g for g in a.sim_gpus.split(",") if g], os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -386,7 +389,7 @@ def main():
                          canon_steps=a.canon_steps, canon_tau0=0.0, poe=a.poe, prior=a.prior, fsteps=a.fsteps, roll=a.roll, seed=a.seed, n_env=n * (2 if a.ph2 else 1),
                          **({"idm_tau": a.idm_tau} if a.idm_tau else {}), **({"idm_stale": a.idm_stale} if a.idm_stale else {}), **({"replan": a.replan} if a.replan else {}),
                          **({"any_far": a.any_far} if a.any_far else {}), **({"near_only": True} if a.near_only else {}), **({"det_cfg": True} if a.det_cfg else {}),
-                         **({"roll_shift": a.exec // 2} if a.exec > a.obs_every > 0 else {}), **({"idm_ens": a.idm_ens} if a.idm_ens else {}), **({"idm_ens_par": True} if a.idm_ens_par else {}), **({"idm_graph": True} if a.idm_graph else {}), **({"idm_ms": True} if a.idm_ms else {}), **({"graphs": True} if a.graphs else {}), **({"compile": a.compile, "compile_on": a.compile_on} if a.compile else {}), **({"chunk_sg": a.chunk_sg} if a.chunk_sg else {}),
+                         **({"roll_shift": a.exec // wpf} if a.exec > a.obs_every > 0 else {}), **({"dec_wpf": wpf} if wpf != 2 else {}), **({"idm_ens": a.idm_ens} if a.idm_ens else {}), **({"idm_ens_par": True} if a.idm_ens_par else {}), **({"idm_graph": True} if a.idm_graph else {}), **({"idm_ms": True} if a.idm_ms else {}), **({"graphs": True} if a.graphs else {}), **({"compile": a.compile, "compile_on": a.compile_on} if a.compile else {}), **({"chunk_sg": a.chunk_sg} if a.chunk_sg else {}),
                          **({"n_avg": a.n_avg} if a.n_avg > 1 else {}), **({"roll_k": a.roll_k, "roll_sel": a.roll_sel, "roll_kc": a.roll_kc} if a.roll_k > 1 else {}),
                          **({"goal_first": True, "gf_fresh": a.gf_fresh} if a.goal_first else {}), **({"lead_k": a.lead_k, "gf_fresh": a.gf_fresh} if a.lead_k else {}),
                          **({"wm_ens": a.wm_ens} if a.wm_ens else {}), **({"wm_data": a.wm_data} if a.wm_data else {}), **({"ov": a.ov, "ov_log": True} if a.ov else {}), **({"t0_ignore": True} if a.t0_ignore else {}), **({"t0_sde": a.t0_sde} if a.t0_sde >= 0 else {})), dev)  # (rteasy) --exec 4 --obs_every 2：中途帧补进历史，MSF 滚动缓存每次决策平移 exec / 2 帧

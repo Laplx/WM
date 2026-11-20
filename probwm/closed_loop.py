@@ -431,6 +431,13 @@ class Policy:
         assert not a.wm_raw or a.canon, "--wm_raw 需要 --canon（给 IDM 的历史用）"
         # (pro 11-17) 视频编码器可配腕部相机（s.nw）：两个视角各自缓存最近几帧、各自取 (t−1, t) 帧对（见 encode），同 camaug --wrist 的编码
         s.dl = getattr(wa, "delta", 1)  # WM 帧间隔（train --delta；V-JEPA 槽位 WM 为 2）：历史 / 本体感觉按 10 Hz 缓存，每 dl 帧取一个
+        s.wpf = int(getattr(s.na, "wpf", 0) or 2) if a.policy == "wm+idm" else 2  # 降频档：IDM（idm train --wpf）的一帧 = wpf 个路点；旧 ckpt = 2
+        if getattr(a, "dec_wpf", 0):  # 降频档（robotwin_eval 在 IDM 的 wpf ≠ 2 时设；真机直接用 Policy 时同样传 dec_wpf=wpf）：历史 / 腕部 / 本体按决策缓存，
+            # 每次决策执行 wpf 个路点 = 1 个 WM 帧，所以这里不再隔 dl 帧取；WM（train --delta）与 IDM 的帧—路点比须一致
+            assert a.dec_wpf == s.wpf == 2 * s.dl and a.policy == "wm+idm" and a.plan == 1 and a.exec % s.wpf == 0, \
+                f"dec_wpf {a.dec_wpf}：IDM wpf {s.wpf}、WM 帧 = 2·delta = {2 * s.dl} 个路点、--exec {a.exec} 须一致（exec 为 wpf 的倍数）"
+            s.dl = 1
+        assert s.wpf == 2 or getattr(a, "dec_wpf", 0), f"IDM 的帧—路点比 wpf = {s.wpf}（idm --wpf）须配 dec_wpf（robotwin_eval 自动设）"
         assert s.dl == 1 or (a.exec == 2 and a.plan == 1 and not (s.nw or a.wmpur or a.pfilt)), "--delta > 1 只支持每 10 Hz 帧决策一次"
         s.hcfg = tuple(float(x) for x in a.hcfg.split(",")) if a.hcfg else None  # 历史 / 文本两路分开的引导（fm.rollout hcfg；WM 需 train --p_hdrop）
         assert not s.hcfg or getattr(wa, "p_hdrop", 0) > 0, "--hcfg 需要用 --p_hdrop 训练过的 WM"
@@ -821,7 +828,7 @@ class Policy:
             elif k == "prev":
                 if s.prev is None:
                     s.prev = torch.zeros(s.a.n_env, n, T, hist.shape[3], dtype=hist.dtype, device=hist.device)
-                d = max(1, s.a.exec // s.idm.STRIDE)
+                d = max(1, s.a.exec // s.wpf)  # 两次决策之间过去的 WM 帧数（wpf 默认 2 = idm.STRIDE，原行为）
                 pv = s.prev[slots][:, None, d:].float()
                 e = -(zc[:, :, :n - d].float() - pv).pow(2).mean((2, 3, 4))
                 sc = sc + torch.where(fresh[:, None], torch.zeros_like(e), std(e))
@@ -1495,7 +1502,7 @@ class Policy:
                     with torch.autocast("cuda", torch.bfloat16):
                         s.wp = (s.p3(p[:, 0].to(hist.dtype)).float() * s.p3.sd + s.p3.mu).cpu().numpy()
                 if s.a.pcons:  # 计划一致性：本次计划与上一次计划在同一绝对时刻的帧上的差（按 rs 归一的均方，patch / 通道平均）；[全部重叠帧, 最近的重叠帧]
-                    d = max(1, s.a.exec // 2)
+                    d = max(1, s.a.exec // s.wpf)  # wpf 默认 2（原行为）
                     of = [int(x) for x in s.wa.tgt_offs.split(",")] if getattr(s.wa, "tgt_offs", "") else list(range(1, p.shape[1] + 1))
                     pr = [(i, of.index(o + d)) for i, o in enumerate(of) if o + d in of]  # (本次槽, 上次槽)：上次的 o + d = 本次的 o
                     if s.pp is None:
