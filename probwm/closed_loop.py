@@ -666,6 +666,22 @@ class Policy:
         out = torch.stack([o0] + eo).mean(0)
         return (out, [o0] + eo) if every else out
 
+    def chunk_smooth(s, acts):  # --chunk_sg W,P：(B, L, ad) 动作块沿 L 个位置做中心 W 点 P 次多项式拟合（两端用首 / 末 W 点的拟合），零延迟（只用这一块自己的路点）
+        w, p = (int(x) for x in s.a.chunk_sg.split(","))
+        L, ad = acts.shape[1], acts.shape[2]
+        assert w % 2 == 1 and p < w <= L and ad in (7, 14), ("--chunk_sg", w, p, L, ad)
+        assert all(getattr(n_, "rtc_pre", None) is None for n_ in [getattr(s, "net", None)] + list(getattr(s, "enets", []))), "--chunk_sg 不与 rtc 前缀同用（会改动前缀位）"
+        if getattr(s, "_sgH", None) is None or s._sgH[0] != (L, w, p):  # (L, L) 平滑矩阵：第 i 行 = 窗口 [a0, a0 + w) 上 p 次拟合在位置 i 的值
+            x, H = np.arange(L, dtype=np.float64), np.zeros((L, L))
+            for i in range(L):
+                a0 = min(max(i - w // 2, 0), L - w)
+                H[i, a0:a0 + w] = np.linalg.pinv(np.vander(x[a0:a0 + w] - x[i], p + 1))[-1]
+            s._sgH = ((L, w, p), torch.tensor(H, dtype=torch.float32, device=acts.device))
+        arm = [d for d in range(ad) if d not in ((6, 13) if ad == 14 else (6,))]  # 夹爪维（RoboTwin 6 / 13，7 维动作的 6）不平滑
+        out = acts.clone()
+        out[:, :, arm] = torch.einsum("ij,bjd->bid", s._sgH[1], acts[:, :, arm].float()).to(acts.dtype)
+        return s.idm.clip(out, s.st)
+
     def rtc_prefix(s, P=None, dv=None):
         """训练时 RTC 的 IDM（idm train --rtc_dmax）：设好后，之后每次 act 输出的动作块前 dv[b] 个路点固定为 P[b, :dv[b]]，其余路点接着这个前缀生成。
         P：(B, d, ad) 原始动作单位（同 act 的输出），= 拍下这一帧之后、新动作块生效之前机器人还会执行的已下发路点，按时间先后；
@@ -1522,6 +1538,8 @@ class Policy:
                     s.net = net0
                     out = out if s.wmix >= 1 else (1 - s.wmix) * out + s.wmix * wo.float()
         acts = s.idm.clip(s.idm.decode(out.float(), s.st), s.st)
+        if getattr(s.a, "chunk_sg", ""):  # --chunk_sg W,P：动作块沿位置做 Savitzky–Golay 平滑（只臂维，夹爪维不动），在时间集成之前；默认关
+            acts = s.chunk_smooth(acts)
         if getattr(s, "ev_c", None) is not None:  # train --ev_roll：这次要执行的最后一个夹爪指令与上次不同 = 事件到了，下次决策事件槽从纯噪声重来
             g = acts[:, min(s.a.exec, acts.shape[1]) - 1, 6] > 0
             s.ev_flip[slots], s.ev_g[slots] = (g != s.ev_g[slots]) & ~fresh, g
@@ -1623,6 +1641,8 @@ def main():
     a("--wm_ens", default="", help="(rteasy) 逗号分隔的另几个 WM ckpt（同特征 / norm / 时距槽）：各自滚动、各自缓存，IDM 读的计划按槽平均；默认关")
     a("--idm_ens", default="", help="(rteasy) 逗号分隔的另几个 IDM ckpt（同配方不同训练种子）：各自采样后与 --idm 的动作块等权平均；默认关")
     a("--idm_graph", action="store_true", help="(rteasy 11-18) IDM 骨干（flow 头之前）按输入形状捕获 CUDA graph（flow 头的 vel 另由 --graphs 捕获）；默认关")
+    a("--chunk_sg", default="", help="W,P（如 7,2）：IDM 动作块（三种子平均、解码到原始单位后）沿位置做 W 点 P 次 Savitzky–Golay 平滑（两端用首 / 末 W 点的拟合；只臂维，"
+      "夹爪维不动），在时间集成之前；零延迟；只与 --ensemble 一起用，不与 rtc 前缀同用；默认关")
     a("--compile", default="", help="torch.compile 模式：default / max-autotune-no-cudagraphs（配 --graphs 时不要用带 inductor cudagraphs 的 max-autotune）；默认空 = 关。"
       "结果不逐位相同（差在 bf16 数值噪声量级）；首次决策要编译，每个新输入形状各编一次")
     a("--compile_on", default="wm,canon,idm,enc", help="--compile 作用的模块：wm = 上下文编码与速度场，canon，idm = flow 头 vel 与骨干 ctx（骨干要 --idm_graph），enc = 视觉编码器")

@@ -18,6 +18,7 @@ FAST=1 bash scripts/run_robotwin.sh wc2-fast --tasks handover_block --cfg demo_c
 
 - 模式：`w40-canon`（W40 WM + 独立 canon）、`wc2`（WC2 WM，规范化由 WM 的 t+0 槽承担）、`wc2-fast`（同 WC2，加 `--idm_stale obs` 的高效推理）。三者共用三个腕部 IDM（三个训练种子等权集成）。
 - `FAST=1` 另开三个只改速度、不改策略输出的选项（见"时延"）。
+- `--chunk_sg 7,2`（可选，追加在命令末尾）：动作块进时间集成之前做块内 SG 平滑（只平滑臂关节、零延迟），见 docs/real_robot.md 第 7 节。
 - `RTC=1` 把三个腕部 IDM 换成训练时 RTC 的版本（`$WMRUNS/rtc/idmPLwrR*.pt`，异步执行时用），配 `--sim_delay d [--rtc]` 在仿真里模拟异步执行；默认不用，见 docs/real_robot.md 第 9 节。
 - 权重单独分发。参考加载器还使用 `WMDATA` 下的 `feats/dinov3_vits16hwf/info.json`、`meta/tasks.json`、`text/flan-t5-large_seen64.pt`。预训练编码器为 `facebook/dinov3-vits16-pretrain-lvd1689m` 和 `google/flan-t5-large`。
 
